@@ -1,15 +1,4 @@
-<link rel="stylesheet" href="https://db23076_arcdemo.css" />
-
-<div id="root"></div>
-<script type="module">
-    import { mount } from "https://cdn.jsdelivr.net/npm/@stlite/browser@0.89.1/build/stlite.js";
-    mount(
-        {
-          requirements: ["pandas", "numpy", "matplotlib"],
-          entrypoint: "streamlit_app.py",
-          files: {
-             "streamlit_app.py": `
-              import streamlit as st
+import streamlit as st
 import matplotlib.pyplot as plt
 import numpy as np
 from streamlit_drawable_canvas import st_canvas
