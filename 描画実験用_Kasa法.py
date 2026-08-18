@@ -1,5 +1,6 @@
 import streamlit as st
 import matplotlib.pyplot as plt
+import japanize_matplotlib
 import numpy as np
 from streamlit_drawable_canvas import st_canvas
 
