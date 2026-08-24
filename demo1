@@ -1,0 +1,2647 @@
+import math
+
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pdimport math
+
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import streamlit as st
+from streamlit_drawable_canvas import st_canvas
+
+matplotlib.use("Agg")
+
+
+# =========================================
+# ------------- FEM section ---------------
+#       モーメント : 反時計回りが正 /  x : 右向きが正 /  y : 上向きが正
+# =========================================
+class UnstableStructure(Exception):
+    """全体剛性マトリクスが特異＝不安定な構造"""
+    
+def make_T3(angle, s_ang, e_ang):
+    """変換マトリクス作成
+
+    angle        : 部材角度
+    s_ang, e_ang : 節点角度（傾斜ローラーなど、節点座標系を傾けるための角度）
+    u_local = T3 @ u_節点座標系
+    """
+    s_dash = float(s_ang) - float(angle)
+    e_dash = float(e_ang) - float(angle)
+
+    sin_s, cos_s = math.sin(math.radians(s_dash)), math.cos(math.radians(s_dash))
+    sin_e, cos_e = math.sin(math.radians(e_dash)), math.cos(math.radians(e_dash))
+
+    return np.array([
+        [cos_s, -sin_s, 0.0,   0.0,    0.0, 0.0],
+        [sin_s,  cos_s, 0.0,   0.0,    0.0, 0.0],
+        [  0.0,    0.0, 1.0,   0.0,    0.0, 0.0],
+        [  0.0,    0.0, 0.0, cos_e, -sin_e, 0.0],
+        [  0.0,    0.0, 0.0, sin_e,  cos_e, 0.0],
+        [  0.0,    0.0, 0.0,   0.0,    0.0, 1.0],
+    ])
+
+
+def esm(E, A, I, L, angle, s_ang, e_ang):
+    """要素剛性マトリクス（全体座標系）"""
+    matrix_L = np.array([
+        [ (E * A) / L,                0.0,               0.0, -(E * A) / L,                0.0,               0.0],
+        [         0.0,  (12 * E * I) / L**3,  (6 * E * I) / L**2,          0.0, -(12 * E * I) / L**3,  (6 * E * I) / L**2],
+        [         0.0,   (6 * E * I) / L**2,     (4 * E * I) / L,          0.0,  -(6 * E * I) / L**2,     (2 * E * I) / L],
+        [-(E * A) / L,                0.0,               0.0,  (E * A) / L,                0.0,               0.0],
+        [         0.0, -(12 * E * I) / L**3, -(6 * E * I) / L**2,          0.0,  (12 * E * I) / L**3, -(6 * E * I) / L**2],
+        [         0.0,   (6 * E * I) / L**2,     (2 * E * I) / L,          0.0,  -(6 * E * I) / L**2,     (4 * E * I) / L],
+    ])
+
+    matrix_T3 = make_T3(angle, s_ang, e_ang)
+    return matrix_T3.T @ matrix_L @ matrix_T3
+
+
+def gsm(matrixs, n_node):
+    """全体剛性マトリクス作成
+
+    ★ main.py は節点番号の最大値から行列サイズを決めていたので、
+       欠番があると大きさが合わない。節点数を引数で受け取るように変更した。
+    """
+    matrix = np.zeros((n_node * 3, n_node * 3))
+    for m in matrixs:
+        s, e = m[1], m[2]
+        ind = [s * 3, s * 3 + 1, s * 3 + 2, e * 3, e * 3 + 1, e * 3 + 2]
+        matrix[np.ix_(ind, ind)] += m[0]
+    return matrix
+
+
+def load_direction(angle):
+    """分布荷重を全体座標の x, y 成分に分解するための係数
+
+    ★ main.py は d_l と member_stress で angle == 360 の扱いが食い違っていたので、
+       角度を 0〜360 に正規化して1か所にまとめた。
+    """
+    x = round(math.sin(math.radians(angle)), 3)
+    y = round(math.cos(math.radians(angle)), 3)
+
+    a = float(angle) % 360
+    if 0 <= a < 90:
+        x = -x
+    elif 90 <= a < 180:
+        x, y = -x, -y
+    elif 180 <= a < 270:
+        y = -y
+    else:
+        x = -x
+    return x, y
+
+
+def d_l(e_l, n_node):
+    """分布荷重のために加算する要素を作成
+
+    ★ main.py は dict の挿入順に値を並べていたため、部材が節点番号順に並んでいないと
+       荷重ベクトルが別の節点にずれて入ってしまう（荷重のかからない節点が飛ばされる）。
+       節点番号でそのまま加算する形に変更した。
+    """
+    dl = np.zeros(n_node * 3)
+
+    for i in e_l:
+        length, angle, Ws, We, start, end = i[6], i[3], i[4], i[5], i[1], i[2]
+        if Ws == 0 and We == 0:
+            continue
+
+        x, y = load_direction(angle)
+
+        Qxs = (length / 20) * (7 * Ws * x + 3 * We * x)   # 各要素の応力算出
+        Qxe = (length / 20) * (3 * Ws * x + 7 * We * x)
+        Qys = (length / 20) * (7 * Ws * y + 3 * We * y)
+        Qye = (length / 20) * (3 * Ws * y + 7 * We * y)
+        Ms = (length**2 / 60) * (3 * Ws + 2 * We)
+        Me = -(length**2 / 60) * (2 * Ws + 3 * We)
+
+        dl[start * 3 : start * 3 + 3] += [Qxs, Qys, Ms]
+        dl[end * 3 : end * 3 + 3] += [Qxe, Qye, Me]
+
+    return dl
+
+
+def d_r(e_l, n_d):
+    """各節点の変位・反力計算
+
+    e_l : element_list
+    n_d : nodes_df
+    """
+    n_node = len(n_d)
+    matrix = gsm(e_l, n_node)              # 全体剛性マトリクス作成
+    dl = d_l(e_l, n_node)                  # 分布荷重考慮
+
+    rc = n_d[["rc_x", "rc_y", "rc_m"]].values.astype(float)   # 拘束条件
+    ef = n_d[["ef_x", "ef_y", "ef_m"]].values.astype(float)   # 外力条件
+    s_angs = n_d["s_ang"].values.astype(float)
+
+    # ★ 傾斜支持節点では拘束方向が傾いているので、外力も節点座標系に回してから解く
+    #    （main.py は外力を全体座標系のまま扱っていた）
+    for i, sa in enumerate(s_angs):
+        if sa != 0:
+            c, s = math.cos(math.radians(sa)), math.sin(math.radians(sa))
+            fx, fy = ef[i, 0], ef[i, 1]
+            ef[i, 0], ef[i, 1] = fx * c + fy * s, -fx * s + fy * c
+
+    matrix_ind = matrix.shape[0]
+    rc_ind = [3 * r + c for r in range(n_node) for c in range(3) if rc[r][c] == 1]
+    ef_ind = [i for i in range(matrix_ind) if i not in set(rc_ind)]
+
+    if not ef_ind:
+        raise UnstableStructure("すべての自由度が拘束されています。")
+
+    aa = dl[ef_ind]
+    ba = dl[rc_ind]
+
+    Kaa = matrix[np.ix_(ef_ind, ef_ind)]
+    Kba = matrix[np.ix_(rc_ind, ef_ind)]
+
+    # ★ main.py は pinv で解いていて、不安定な構造でも「それらしい」解を返してしまう。
+    #    ランクを見て不安定を検出してから解く
+    if np.linalg.matrix_rank(Kaa) < len(ef_ind):
+        raise UnstableStructure("剛性マトリクスが特異です。支点が不足しているか、構造が不安定です。")
+
+    Pa = ef.flatten()[ef_ind] - aa         # 計算に必要な外力条件
+    Ua = np.linalg.pinv(Kaa) @ Pa          # 移動する節点の変位
+    Pb = (Kba @ Ua) + ba                   # 支点反力
+
+    U = np.zeros(matrix_ind)
+    U[ef_ind] = Ua
+    P = np.zeros(matrix_ind)
+    P[ef_ind] = ef.flatten()[ef_ind]
+    P[rc_ind] = Pb
+
+    R = np.zeros(matrix_ind)   # 反力だけを取り出したベクトル（拘束していないDOFは0）
+    R[rc_ind] = Pb
+
+    # 傾斜支持節点の変位・力を、節点座標系から全体座標系に戻す
+    # （main.py の「傾斜支持節点処理」と同じ内容を、節点ごとに1回だけ行う形にした）
+    for i, sa in enumerate(s_angs):
+        if sa != 0:
+            c, s = math.cos(math.radians(sa)), math.sin(math.radians(sa))
+            for vec in (U, P, R):
+                a, b = vec[3 * i], vec[3 * i + 1]
+                vec[3 * i], vec[3 * i + 1] = a * c - b * s, a * s + b * c
+
+    # 各節点の変位と力をdfにまとめる
+    df = pd.DataFrame(
+        np.column_stack([P.reshape(-1, 3), U.reshape(-1, 3), R.reshape(-1, 3)]),
+        columns=["Px", "Py", "M", "u", "v", "theta", "Rx", "Ry", "Rm"],
+    ).astype(float)
+    df.insert(0, "No", n_d["No"].values)
+    return df
+
+
+def member_stress(e_l, D_R, n_d, div):
+    """部材応力計算
+
+    e_l : element_list
+    D_R : 各節点の変位・反力df
+    n_d : nodes_df
+    div : 部材の分割数（★ main.py は step 幅の整数ループだったため、
+          部材長が小さい／整数でないと終点まで届かない。分割数指定に変更した）
+    """
+    node = n_d[["x", "y"]].values.astype(float)
+
+    disp_df_list = []
+    for i in e_l:
+        length, angle = i[6], i[3]
+        Ws, We = i[4], i[5]
+        E, A, I = i[9], i[10], i[11]
+
+        sin = math.sin(math.radians(angle))
+        cos = math.cos(math.radians(angle))
+
+        x, y = load_direction(angle)                 # 力をx, yに分解
+
+        Qxs = (length / 20) * (7 * Ws * x + 3 * We * x)
+        Qxe = (length / 20) * (3 * Ws * x + 7 * We * x)
+        Qys = (length / 20) * (7 * Ws * y + 3 * We * y)
+        Qye = (length / 20) * (3 * Ws * y + 7 * We * y)
+        # ★ main.py はここだけ Ms, Me の符号が d_l と逆になっていて、
+        #    分布荷重を入れると M 図が一定値だけ上下にずれる（Q 図・変形図は正しい）。
+        #    d_l と同符号にそろえる
+        Ms = (length**2 / 60) * (3 * Ws + 2 * We)
+        Me = -(length**2 / 60) * (2 * Ws + 3 * We)
+
+        if Ws != 0 or We != 0:
+            Wxy = [-Ws * x, -Ws * y, 1, -We * x, -We * y, 1]
+        else:
+            Wxy = [0, 0, 0, 0, 0, 0]
+
+        # 全体座標系の要素剛性マトリクスを新たに生成する
+        # ★ main.py はここで E, A, I を定数で書いていて elements_df の値が無視されていた
+        Kg = esm(E, A, I, length, angle, 0, 0)
+        UV = D_R[["u", "v", "theta"]]                 # 節点変位(基準座標・全体座標系)
+        Ug = UV.iloc[i[1]].values.tolist() + UV.iloc[i[2]].values.tolist()
+        Fg_G = (Kg @ Ug) + np.array([Qxs, Qys, Ms, Qxe, Qye, Me])   # 部材応力(基準座標)
+
+        T3 = make_T3(angle, 0, 0)                    # 変換マトリクス
+        Fg_L = (T3 @ Fg_G).tolist()                  # 部材応力(局所座標)
+        Fg_L = [Fg_L[0], Fg_L[1], -Fg_L[2], Fg_L[3], -Fg_L[4], Fg_L[5]]  # 正負の整合を整理
+        Wuv = T3 @ np.array(Wxy, dtype=float)
+
+        # 変形・応力算出
+        start = node[i[1]]                           # 部材の始点座標[x, y]
+        d_list = UV.iloc[[i[1], i[2]]].values.tolist()
+        Us, Vs, Ts = d_list[0]                       # start節点の変位・回転角(標準座標)
+        Ue, Ve, Te = d_list[1]                       # end節点の変位・回転角(標準座標)
+
+        Us_l, Vs_l = Us * cos + Vs * sin, -Us * sin + Vs * cos   # start節点の変位(局所座標)
+        Ue_l, Ve_l = Ue * cos + Ve * sin, -Ue * sin + Ve * cos   # end節点の変位(局所座標)
+
+        disp_list = []
+        for xd in np.linspace(0.0, length, int(div) + 1):
+            Ux = (1 - xd / length) * Us_l + (xd / length) * Ue_l          # 材軸方向の変位
+            Vx = np.array([
+                1 - 3 * xd**2 / length**2 + 2 * xd**3 / length**3,
+                xd - 2 * xd**2 / length + xd**3 / length**2,
+                3 * xd**2 / length**2 - 2 * xd**3 / length**3,
+                -1 * xd**2 / length + xd**3 / length**2,
+            ]) @ [Vs_l, Ts, Ve_l, Te]                                     # 材軸直交方向の変位
+
+            if Ws != 0 or We != 0:
+                # ★ 分布荷重による部材内の付加たわみ（両端固定梁の特解）。
+                #    main.py は節点変位の補間だけなので、分布荷重時にたわみが小さく出る
+                w = (Wuv[1] + Wuv[4]) / 2
+                Vx += w * xd**2 * (length - xd) ** 2 / (24 * E * I)
+
+            dx = Ux * cos - Vx * sin                 # x方向変位(標準座標)
+            dy = Ux * sin + Vx * cos                 # y方向変位(標準座標)
+
+            c_x = xd * cos + start[0]                # 移動前地点の座標
+            c_y = xd * sin + start[1]
+
+            # 軸方向力・せん断力・モーメント
+            N = -(Wuv[3] - Wuv[0]) / 2 * xd**2 / length - Wuv[0] * xd + Fg_L[0]
+            Q = (Wuv[4] - Wuv[1]) / 2 * xd**2 / length + Wuv[1] * xd + Fg_L[1]
+            M = ((Wuv[4] - Wuv[1]) / 6 * xd**3 / length + Wuv[1] / 2 * xd**2
+                 + Fg_L[1] * xd + Fg_L[2])
+
+            # ★ main.py の N は圧縮が正。ここでは引張を正にそろえる
+            disp_list.append([xd, c_x, c_y, dx, dy, -N, Q, M])
+
+        disp_df_list.append(pd.DataFrame(
+            np.array(disp_list),
+            columns=["delta", "x", "y", "dx", "dy", "N", "Q", "M"],
+        ))
+
+    return disp_df_list
+
+
+def fem_calc(elements_df, nodes_df, div=20):
+    """FEM解析プログラム
+
+    elements_df : 部材df（young, area, s_moment, length, angle, start, end, Ws, We）
+    nodes_df    : 節点df（No, x, y, rc_x, rc_y, rc_m, ef_x, ef_y, ef_m, s_ang）
+    """
+    nodes_df = nodes_df.reset_index(drop=True)
+    elements_df = elements_df.reset_index(drop=True)
+
+    # 節点番号 → 行番号（欠番があっても動くように）
+    idx = {int(no): i for i, no in enumerate(nodes_df["No"].tolist())}
+
+    # elements_list = [esm, start, end, angle, Ws, We, length, s_ang, e_ang, E, A, I]
+    elements_list = []
+    for _, r in elements_df.iterrows():
+        s, e = idx[int(r["start"])], idx[int(r["end"])]
+        s_ang = float(nodes_df["s_ang"].iloc[s])            # 始点節点角度
+        e_ang = float(nodes_df["s_ang"].iloc[e])            # 終点節点角度
+        E, A, I = float(r["young"]), float(r["area"]), float(r["s_moment"])
+        L, ang = float(r["length"]), float(r["angle"])
+
+        elements_list.append([
+            esm(E, A, I, L, ang, s_ang, e_ang), s, e, ang,
+            float(r["Ws"]), float(r["We"]), L, s_ang, e_ang, E, A, I,
+        ])
+
+    D_R = d_r(elements_list, nodes_df)                      # 各節点の変位・反力計算
+    M_S = member_stress(elements_list, D_R, nodes_df, div)  # 部材応力計算
+
+    return D_R, M_S
+
+
+def solve(elements_df, nodes_df, div=20):
+    """作図側が使うための入口。部材ごとの応力・変位dfのリストを返す"""
+    if len(elements_df) == 0 or len(nodes_df) == 0:
+        return []
+
+    D_R, M_S = fem_calc(elements_df, nodes_df, div)
+
+    reactions = D_R[["No", "Rx", "Ry", "Rm"]].copy()
+
+    for d in M_S:
+        d.attrs["reactions"] = reactions
+        d.attrs["D_R"] = D_R
+    return M_S
+
+# Streamlit app タイトル
+st.set_page_config(page_title="図形描画デモ", layout="wide")
+st.title("図形描画デモ")
+st.caption("手描き線をRDP法で簡略化して「線分」「円弧」に判定し、線分の角度を15°刻みに整えたうえで骨組みとして応力図（N・Q・M）を描きます。")
+
+CANVAS_W, CANVAS_H = 700, 450
+
+LINE_COLOR = "#1f77b4"   # 線分
+ARC_COLOR = "#2ca02c"    # 円弧
+NODE_COLOR = "#d62728"   # 節点
+COND_COLOR = "#7f4fbf"   # 支点・荷重
+
+
+# ==========================================================
+# 座標取得（fabric.js のパス → 点列）
+# ==========================================================
+def quad_bezier(p0, p1, p2, n=8):
+    """2次ベジェ曲線を n 点にサンプリングする"""
+    t = np.linspace(0.0, 1.0, n)[:, None]
+    p0, p1, p2 = np.array(p0, float), np.array(p1, float), np.array(p2, float)
+    return (1 - t) ** 2 * p0 + 2 * (1 - t) * t * p1 + t**2 * p2
+
+
+def path_to_points(path):
+    """
+    fabric.js のパス命令を (x, y) の点列に変換する。
+    freedraw は ["M",x,y] / ["Q",cx,cy,x,y] / ["L",x,y] を返すので、
+    命令ごとに引数の数が違う点に注意（Q の cmd[1],cmd[2] は制御点であって通過点ではない）。
+    """
+    pts, cur = [], None
+    for cmd in path:
+        op = cmd[0]
+        if op in ("M", "L"):
+            cur = [cmd[1], cmd[2]]
+            pts.append(cur)
+        elif op == "Q" and cur is not None:
+            seg = quad_bezier(cur, [cmd[1], cmd[2]], [cmd[3], cmd[4]])
+            pts.extend(seg[1:].tolist())
+            cur = [cmd[3], cmd[4]]
+        elif op == "C" and cur is not None:
+            cur = [cmd[5], cmd[6]]
+            pts.append(cur)
+
+    if len(pts) < 2:
+        return np.zeros((0, 2))
+
+    pts = np.asarray(pts, dtype=float)
+    # 連続する重複点を除去（重複があるとRDPでゼロ除算が起きる）
+    keep = np.ones(len(pts), dtype=bool)
+    keep[1:] = np.hypot(pts[1:, 0] - pts[:-1, 0], pts[1:, 1] - pts[:-1, 1]) > 1e-9
+    return pts[keep]
+
+
+# ==========================================================
+# RDP法アルゴリズム
+# ==========================================================
+def perpendicular_distance(point, start, end):
+    """直線 start-end と点 point の距離を計算する"""
+    x, y = point[0], point[1]
+    x1, y1 = start[0], start[1]
+    x2, y2 = end[0], end[1]
+
+    denom = np.hypot(y2 - y1, x2 - x1)
+    if denom == 0:
+        # start と end が同一点のときは点と点の距離を返す（ゼロ除算の回避）
+        return float(np.hypot(x - x1, y - y1))
+
+    return float(abs((y2 - y1) * x - (x2 - x1) * y + x2 * y1 - y2 * x1) / denom)
+
+
+def douglas_peucker(point_list, start, end, epsilon):
+    """point_list[start:end] を簡略化した点列を返す（end は含まない）"""
+    # 点が2個以下ならこれ以上簡略化できない（再帰の終了条件）
+    if end - start <= 1:
+        return [point_list[start]]
+    if end - start == 2:
+        return [point_list[start], point_list[end - 1]]
+
+    # 直線からの距離が最大の点を見つける
+    dmax, index = 0.0, start + 1
+    for i in range(start + 1, end - 1):
+        d = perpendicular_distance(point_list[i], point_list[start], point_list[end - 1])
+        if d > dmax:
+            index, dmax = i, d
+
+    # 最大距離が閾値を超えた場合、再帰的に処理する
+    if dmax > epsilon:
+        rec_results1 = douglas_peucker(point_list, start, index + 1, epsilon)
+        rec_results2 = douglas_peucker(point_list, index, end, epsilon)
+
+        # 結果を結合する（分岐点が重複するので先頭を除いて連結）
+        rec_results1.extend(rec_results2[1:])
+        return rec_results1
+    else:
+        return [point_list[start], point_list[end - 1]]
+
+
+def douglas_peucker_indices(points, epsilon):
+    """RDPで残る点の「添字」を返す（線分/円弧の判定で元の点列を参照するため）"""
+    n = len(points)
+    if n < 3:
+        return list(range(n))
+
+    keep = {0, n - 1}
+    stack = [(0, n - 1)]
+    while stack:  # 再帰の深さ制限に引っかからないようスタックで実装
+        s, e = stack.pop()
+        if e - s < 2:
+            continue
+        dmax, index = 0.0, -1
+        for i in range(s + 1, e):
+            d = perpendicular_distance(points[i], points[s], points[e])
+            if d > dmax:
+                dmax, index = d, i
+        if dmax > epsilon and index > 0:
+            keep.add(index)
+            stack.append((s, index))
+            stack.append((index, e))
+    return sorted(keep)
+
+
+# ==========================================================
+# 線分 / 円弧のあてはめ
+# ==========================================================
+def line_error(pts):
+    """両端を結ぶ直線からの最大ずれ"""
+    if len(pts) < 3:
+        return 0.0
+    return max(perpendicular_distance(p, pts[0], pts[-1]) for p in pts[1:-1])
+
+
+def fit_circle(pts):
+    """最小二乗による円あてはめ（Kasa法）。(cx, cy, r) を返す。失敗時は None"""
+    if len(pts) < 3:
+        return None
+    x, y = pts[:, 0], pts[:, 1]
+    A = np.column_stack([x, y, np.ones(len(x))])
+    b = x**2 + y**2
+    try:
+        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    cx, cy = sol[0] / 2.0, sol[1] / 2.0
+    val = sol[2] + cx**2 + cy**2
+    if not np.isfinite(val) or val <= 0:
+        return None
+    return float(cx), float(cy), float(np.sqrt(val))
+
+
+def arc_error(pts, circle):
+    """円からの最大ずれ"""
+    cx, cy, r = circle
+    return float(np.max(np.abs(np.hypot(pts[:, 0] - cx, pts[:, 1] - cy) - r)))
+
+
+def arc_angles(pts, circle):
+    """点列に沿って角度を連続化し、(開始角, 終了角) を返す"""
+    cx, cy, _ = circle
+    ang = np.unwrap(np.arctan2(pts[:, 1] - cy, pts[:, 0] - cx))
+    return float(ang[0]), float(ang[-1])
+
+
+def make_line(points, i0, i1):
+    sub = points[i0 : i1 + 1]
+    return {
+        "type": "線分", "i0": i0, "i1": i1,
+        "start": sub[0], "end": sub[-1],
+        "length": float(np.hypot(*(sub[-1] - sub[0]))),
+        "error": line_error(sub),
+    }
+
+
+def make_arc(points, i0, i1, circle):
+    sub = points[i0 : i1 + 1]
+    a0, a1 = arc_angles(sub, circle)
+    return {
+        "type": "円弧", "i0": i0, "i1": i1,
+        "center": (circle[0], circle[1]), "radius": circle[2],
+        "a0": a0, "a1": a1,
+        "error": arc_error(sub, circle),
+        "start": sub[0], "end": sub[-1],
+    }
+
+
+def merge_primitives(points, prims, tol):
+    """RDPの頂点が細かすぎて分断された図形を、同じ図形とみなせる範囲で結合する"""
+    merged = []
+    for p in prims:
+        if merged:
+            prev = merged[-1]
+            sub = points[prev["i0"] : p["i1"] + 1]
+
+            # 隣り合う線分どうしが1本の直線とみなせるなら結合
+            if prev["type"] == "線分" and p["type"] == "線分" and line_error(sub) <= tol * 1.5:
+                merged[-1] = make_line(points, prev["i0"], p["i1"])
+                continue
+
+            # 円弧に隣接する短い区間が同じ円に乗るなら円弧に吸収させる
+            if prev["type"] == "円弧" or p["type"] == "円弧":
+                c = fit_circle(sub)
+                if c is not None and arc_error(sub, c) <= tol * 1.5:
+                    merged[-1] = make_arc(points, prev["i0"], p["i1"], c)
+                    continue
+
+        merged.append(p)
+    return merged
+
+
+def segment_stroke(points, epsilon, tol):
+    """
+    ストロークを「線分」と「円弧」の列に分解する。
+    RDPで求めた頂点を切れ目の候補として、各位置から一番長く伸ばせる形状を貪欲に選ぶ。
+    """
+    idx = douglas_peucker_indices(points, epsilon)
+    prims = []
+
+    i = 0
+    while i < len(idx) - 1:
+        # --- 直線として何区間まで伸ばせるか ---
+        j_line = i + 1
+        for j in range(i + 1, len(idx)):
+            if line_error(points[idx[i] : idx[j] + 1]) <= tol:
+                j_line = j
+            else:
+                break
+
+        # --- 円弧として何区間まで伸ばせるか（円弧は最低2区間必要） ---
+        j_arc, arc_fit = i, None
+        for j in range(i + 2, len(idx)):
+            sub = points[idx[i] : idx[j] + 1]
+            c = fit_circle(sub)
+            if c is None:
+                break
+            span = float(np.hypot(*(sub[-1] - sub[0])))
+            # 半径が大きすぎる＝ほぼ直線なので円弧とはみなさない
+            # （20倍だと、ほぼまっすぐな部材まで円弧と判定されて骨組みから外れてしまう）
+            if c[2] > max(span, 1.0) * 5:
+                break
+            if arc_error(sub, c) <= tol:
+                j_arc, arc_fit = j, c
+            else:
+                break
+
+        # 長く説明できたほうを採用（同じなら線分を優先）
+        if j_arc > j_line and arc_fit is not None:
+            prims.append(make_arc(points, idx[i], idx[j_arc], arc_fit))
+            i = j_arc
+        else:
+            prims.append(make_line(points, idx[i], idx[j_line]))
+            i = j_line
+
+    return idx, merge_primitives(points, prims, tol)
+
+
+def primitive_xy(p, n=96):
+    """図形を描くための座標列を返す"""
+    if p["type"] == "線分":
+        return np.array([p["start"], p["end"]], dtype=float)
+    t = np.linspace(p["a0"], p["a1"], n)
+    cx, cy = p["center"]
+    return np.column_stack([cx + p["radius"] * np.cos(t), cy + p["radius"] * np.sin(t)])
+
+
+# ==========================================================
+# 部材角度の15°スナップ
+#   draw_lib.py の judg_poly と同じ考え方。
+#   1ストローク内で連続する線分をひとまとまり（多角線分）として扱い、
+#     ・端の線分は外側の端点を固定して回す
+#     ・間の線分は中点を中心に回す
+#   角度を15°刻みに丸めたあと、隣り合う線分の交点を取り直して節点をつなぎ直す。
+# ==========================================================
+ANGLE_STEP = 15                      # 角度調整のパラメータ（何度刻みに丸めるか）
+
+
+def line_angle(p, q):
+    """2点の角度を求める（0〜360度）"""
+    return math.degrees(math.atan2(q[1] - p[1], q[0] - p[0])) % 360
+
+
+def cross_point(p, u, q, v, fallback, limit):
+    """点p・方向uの直線と、点q・方向vの直線の交点
+
+    平行なとき、または交点が元の節点から limit 以上離れるときは fallback を返す。
+    """
+    den = u[0] * v[1] - u[1] * v[0]
+    if abs(den) < 1e-9:                       # 平行（丸めた結果、同じ角度になった）
+        return fallback
+
+    t = ((q[0] - p[0]) * v[1] - (q[1] - p[1]) * v[0]) / den
+    c = np.asarray(p, dtype=float) + t * np.asarray(u, dtype=float)
+    if float(np.hypot(*(c - fallback))) > limit:
+        return fallback
+    return c
+
+
+def _snap_chain(pts, step, close_tol):
+    """つながった折れ線の各辺の角度を step 度刻みに丸め、新しい節点列を返す"""
+    pts = [np.array(p, dtype=float) for p in pts]
+    n = len(pts) - 1                                  # 辺の数
+    angles = [(round(line_angle(pts[k], pts[k + 1]) / step) * step) % 360
+              for k in range(n)]
+
+    # 丸めた結果が同じ角度になった辺どうしは1本の直線としてまとめる
+    groups = []
+    for k in range(n):
+        if groups and angles[k] == angles[groups[-1][0]]:
+            groups[-1].append(k)
+        else:
+            groups.append([k])
+
+    new_pts = [None] * (n + 1)
+    lines = []                                        # 各グループの直線 (通る点, 方向ベクトル)
+
+    for gi, g in enumerate(groups):
+        a = math.radians(angles[g[0]])
+        u = np.array([math.cos(a), math.sin(a)])
+
+        idx = list(range(g[0], g[-1] + 2))            # このグループが持つ節点の添字
+        seg = [pts[i] for i in idx]
+        acc = [0.0]                                   # 元の折れ線に沿った累積長
+        for i in range(len(seg) - 1):
+            acc.append(acc[-1] + float(np.hypot(*(seg[i + 1] - seg[i]))))
+
+        if len(groups) == 1 or (gi > 0 and gi < len(groups) - 1):
+            anchor, s_a = (seg[0] + seg[-1]) / 2, acc[-1] / 2   # 間の辺は中点を中心に回す
+        elif gi == 0:
+            anchor, s_a = seg[0], 0.0                           # 始めの辺は始点を固定
+        else:
+            anchor, s_a = seg[-1], acc[-1]                      # 終わりの辺は終点を固定
+
+        for i, t in zip(idx, acc):
+            new_pts[i] = anchor + (t - s_a) * u
+        lines.append((anchor, u, acc[-1]))     # (通る点, 方向, グループの長さ)
+
+    # 角度の違う直線どうしは、交点を取り直して節点をつなぎ直す
+    for gi in range(len(groups) - 1):
+        j = groups[gi][-1] + 1
+        a, ua, la = lines[gi]
+        b, ub, lb = lines[gi + 1]
+        new_pts[j] = cross_point(a, ua, b, ub, new_pts[j], max(la, lb))
+
+    # 始点と終点が近ければ多角形とみなし、終わりの辺と始めの辺の交点で閉じる
+    if len(groups) > 2 and float(np.hypot(*(pts[0] - pts[-1]))) < close_tol:
+        a, ua, la = lines[-1]
+        b, ub, lb = lines[0]
+        mid = (new_pts[0] + new_pts[-1]) / 2
+        c = cross_point(a, ua, b, ub, mid, max(la, lb))
+        new_pts[0] = new_pts[-1] = c
+
+    return new_pts
+
+
+def snap_line_angles(prims, step=ANGLE_STEP, close_tol=25.0):
+    """1ストローク分のプリミティブについて、線分の角度を step 度刻みに丸める"""
+    prims = list(prims)
+
+    i = 0
+    while i < len(prims):
+        if prims[i]["type"] != "線分":
+            i += 1
+            continue
+
+        j = i
+        while j < len(prims) and prims[j]["type"] == "線分":   # 連続する線分のまとまり
+            j += 1
+
+        chain = [prims[i]["start"]] + [p["end"] for p in prims[i:j]]
+        new_pts = _snap_chain(chain, step, close_tol)
+
+        for k, p in enumerate(prims[i:j]):
+            p["start"], p["end"] = new_pts[k], new_pts[k + 1]
+            p["length"] = float(np.hypot(*(new_pts[k + 1] - new_pts[k])))
+
+        i = j
+
+    return prims
+
+
+# ==========================================================
+# 清書結果をキャンバスに戻すための fabric.js オブジェクト生成
+# ==========================================================
+def to_fabric_path(xy, color, stroke_width):
+    """点列を fabric.js の path オブジェクト（辞書）に変換する"""
+    xy = np.asarray(xy, dtype=float)
+    cmds = [["M", float(xy[0, 0]), float(xy[0, 1])]]
+    cmds += [["L", float(x), float(y)] for x, y in xy[1:]]
+
+    minx, miny = xy.min(axis=0)
+    maxx, maxy = xy.max(axis=0)
+    return {
+        "type": "path", "version": "4.4.0", "originX": "left", "originY": "top",
+        "left": float(minx), "top": float(miny),
+        "width": float(maxx - minx), "height": float(maxy - miny),
+        "fill": None, "stroke": color, "strokeWidth": stroke_width,
+        "strokeDashArray": None, "strokeLineCap": "round", "strokeDashOffset": 0,
+        "strokeLineJoin": "round", "strokeUniform": False, "strokeMiterLimit": 10,
+        "scaleX": 1, "scaleY": 1, "angle": 0, "flipX": False, "flipY": False,
+        "opacity": 1, "shadow": None, "visible": True, "backgroundColor": "",
+        "fillRule": "nonzero", "paintFirst": "fill",
+        "globalCompositeOperation": "source-over", "skewX": 0, "skewY": 0,
+        "path": cmds,
+    }
+
+
+# ==========================================================
+# 骨組みモデル（節点・部材）の構築
+#   線分プリミティブだけを部材として扱う。円弧は解析対象外。
+#   キャンバスは y が下向きなので、モデルは y を反転して保持する（y上向き）。
+# ==========================================================
+def to_math(p):
+    """キャンバス座標 → 数学座標（y上向き）"""
+    return np.array([p[0], CANVAS_H - p[1]], dtype=float)
+
+
+def to_canvas(p):
+    """数学座標 → キャンバス座標"""
+    return np.array([p[0], CANVAS_H - p[1]], dtype=float)
+
+
+def point_on_segment(a, b, c, tol):
+    """線分 ab 上に点 c が乗っているか（乗っていれば端点からの距離を返す）"""
+    ab = b - a
+    L2 = float(ab @ ab)
+    if L2 < 1e-12:
+        return None
+    t = float((c - a) @ ab) / L2
+    if not (1e-6 < t < 1 - 1e-6):
+        return None
+    foot = a + t * ab
+    if float(np.hypot(*(c - foot))) > tol:
+        return None
+    return t
+
+
+def build_frame(prims, node_tol):
+    """線分プリミティブから node_df / line_df を作る（座標は数学座標のpx）"""
+    segments = [(to_math(p["start"]), to_math(p["end"]))
+                for p in prims if p["type"] == "線分"]
+    # 長さが節点判定距離に満たない線分は、節点を増やすだけなので捨てる
+    segments = [(a, b) for a, b in segments if float(np.hypot(*(b - a))) > node_tol]
+
+    nodes = []                       # 節点座標のリスト
+
+    def node_id(p):
+        """近い既存節点があればその番号、無ければ新規登録"""
+        for i, q in enumerate(nodes):
+            if float(np.hypot(*(p - q))) <= node_tol:
+                return i
+        nodes.append(np.array(p, dtype=float))
+        return len(nodes) - 1
+
+    members = []
+    for a, b in segments:
+        ia, ib = node_id(a), node_id(b)
+        if ia != ib:
+            members.append([ia, ib])
+
+    # 部材の途中に他の節点が乗っている場合は、そこで部材を分割する
+    changed = True
+    while changed:
+        changed = False
+        for m_i, (ia, ib) in enumerate(list(members)):
+            a, b = nodes[ia], nodes[ib]
+            hits = []
+            for k in range(len(nodes)):
+                if k in (ia, ib):
+                    continue
+                t = point_on_segment(a, b, nodes[k], node_tol)
+                if t is not None:
+                    hits.append((t, k))
+            if hits:
+                hits.sort()
+                chain = [ia] + [k for _, k in hits] + [ib]
+                members.pop(m_i)
+                members.extend([[chain[i], chain[i + 1]] for i in range(len(chain) - 1)])
+                changed = True
+                break
+
+    # 重複部材の除去
+    seen, uniq = set(), []
+    for ia, ib in members:
+        key = tuple(sorted((ia, ib)))
+        if key not in seen:
+            seen.add(key)
+            uniq.append([ia, ib])
+
+    node_df = pd.DataFrame(
+        [{"No": i, "x": float(p[0]), "y": float(p[1])} for i, p in enumerate(nodes)]
+    )
+    line_df = pd.DataFrame(
+        [{"s_node": ia, "e_node": ib} for ia, ib in uniq]
+    )
+    if len(node_df) == 0:
+        node_df = pd.DataFrame(columns=["No", "x", "y"])
+    if len(line_df) == 0:
+        line_df = pd.DataFrame(columns=["s_node", "e_node"])
+    return node_df, line_df
+
+
+def nearest_node(node_df, p, tol):
+    """数学座標 p に最も近い節点番号（tol以内）"""
+    if len(node_df) == 0:
+        return None
+    d = np.hypot(node_df["x"].values - p[0], node_df["y"].values - p[1])
+    i = int(np.argmin(d))
+    return int(node_df["No"].iloc[i]) if d[i] <= tol else None
+
+
+# ==========================================================
+# 支点・荷重条件
+#   節点番号は清書のたびに振り直されるので、条件は「座標」で保持して毎回マッピングする
+# ==========================================================
+BLANK_COND = {"stick": 0, "s_ang": 0.0, "point": 0, "point_ang": 270.0,
+              "moment": 0, "moment_dir": 0}
+STICK_NAME = {0: "-", 1: "ピン", 2: "ローラー", 3: "固定"}
+
+
+def conditions_to_df(conditions, node_df, tol):
+    """条件リストを input_df（節点番号つき）に変換する"""
+    rows = []
+    for c in conditions:
+        no = nearest_node(node_df, np.array([c["x"], c["y"]]), tol)
+        if no is None:
+            continue
+        row = {"No": no}
+        row.update({k: c[k] for k in BLANK_COND})
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(columns=["No"] + list(BLANK_COND))
+    df = pd.DataFrame(rows)
+    return df.groupby("No", as_index=False).last()
+
+
+def make_dfs(node_df, line_df, input_df, E, A, I, scale, P, M0):
+    """FEMプログラムへ渡すためのデータ作成（draw_lib.py の make_dfs と同じ列構成）"""
+    nodes = node_df.copy()
+    nodes["x"] = nodes["x"] * scale          # px → m
+    nodes["y"] = nodes["y"] * scale
+    for col in ["rc_x", "rc_y", "rc_m", "ef_x", "ef_y", "ef_m", "s_ang"]:
+        nodes[col] = 0.0
+
+    for _, r in input_df.iterrows():
+        m = nodes["No"] == r["No"]
+        if r["stick"] == 1:                  # ピン支点
+            nodes.loc[m, ["rc_x", "rc_y"]] = [1, 1]
+        elif r["stick"] == 2:                # ローラー支点
+            # s_ang を与えると節点座標系ごと傾き、傾斜ローラーになる
+            nodes.loc[m, "rc_y"] = 1
+            nodes.loc[m, "s_ang"] = float(r.get("s_ang", 0.0))
+        elif r["stick"] == 3:                # 固定支点
+            nodes.loc[m, ["rc_x", "rc_y", "rc_m"]] = [1, 1, 1]
+
+        if r["point"] == 1:                  # 集中荷重（point_ang 方向に大きさ P）
+            a = math.radians(float(r["point_ang"]))
+            nodes.loc[m, "ef_x"] += P * math.cos(a)
+            nodes.loc[m, "ef_y"] += P * math.sin(a)
+
+        if r["moment"] == 1:                 # モーメント荷重
+            nodes.loc[m, "ef_m"] += M0 if r["moment_dir"] == 0 else -M0
+
+    rows = []
+    for _, r in line_df.iterrows():
+        p = nodes[nodes["No"] == r["s_node"]][["x", "y"]].values[0].astype(float)
+        q = nodes[nodes["No"] == r["e_node"]][["x", "y"]].values[0].astype(float)
+        rows.append({
+            "young": E, "area": A, "s_moment": I,
+            "length": float(np.hypot(*(q - p))),
+            "angle": math.degrees(math.atan2(q[1] - p[1], q[0] - p[0])) % 360,
+            "start": int(r["s_node"]), "end": int(r["e_node"]),
+            "Ws": 0.0, "We": 0.0,
+        })
+    elements_df = pd.DataFrame(
+        rows, columns=["young", "area", "s_moment", "length", "angle", "start", "end", "Ws", "We"]
+    )
+    nodes_df = nodes[["No", "x", "y", "rc_x", "rc_y", "rc_m",
+                      "ef_x", "ef_y", "ef_m", "s_ang"]]
+    return elements_df, nodes_df
+
+
+# ==========================================================
+# キャンバスに描く記号（支点・荷重）
+# ==========================================================
+def cond_symbols(node_df, input_df, stroke_width):
+    """支点・荷重を表す fabric オブジェクトのリスト（キャンバス座標）"""
+    objs = []
+    for _, r in input_df.iterrows():
+        hit = node_df[node_df["No"] == r["No"]]
+        if len(hit) == 0:
+            continue
+        cx, cy = to_canvas(hit[["x", "y"]].values[0].astype(float))
+
+        if r["stick"] in (1, 2):                          # ピン / ローラー
+            objs.append(to_fabric_path(
+                [[cx, cy], [cx - 11, cy + 19], [cx + 11, cy + 19], [cx, cy]],
+                COND_COLOR, stroke_width))
+            if r["stick"] == 2:                           # ローラーは下に線を1本
+                objs.append(to_fabric_path(
+                    [[cx - 13, cy + 24], [cx + 13, cy + 24]], COND_COLOR, stroke_width))
+        elif r["stick"] == 3:                             # 固定
+            objs.append(to_fabric_path(
+                [[cx - 16, cy], [cx + 16, cy]], COND_COLOR, stroke_width))
+            for k in range(-3, 4):                        # ハッチング
+                objs.append(to_fabric_path(
+                    [[cx + k * 5, cy], [cx + k * 5 - 6, cy + 10]], COND_COLOR, 1))
+
+        if r["point"] == 1:                               # 集中荷重（矢印）
+            a = math.radians(float(r["point_ang"]))
+            d = np.array([math.cos(a), -math.sin(a)])     # キャンバスは y 下向き
+            tail = np.array([cx, cy]) - d * 45
+            head = np.array([cx, cy]) - d * 4
+            n = np.array([-d[1], d[0]])
+            objs.append(to_fabric_path([tail, head], COND_COLOR, stroke_width))
+            objs.append(to_fabric_path(
+                [head - d * 10 + n * 5, head, head - d * 10 - n * 5], COND_COLOR, stroke_width))
+
+        if r["moment"] == 1:                              # モーメント荷重（円弧＋矢じり）
+            sign = 1 if r["moment_dir"] == 0 else -1
+            t = np.linspace(math.radians(40), math.radians(300), 40)[::sign]
+            arc = np.column_stack([cx + 18 * np.cos(t), cy - 18 * np.sin(t)])
+            objs.append(to_fabric_path(arc, COND_COLOR, stroke_width))
+            tip, prev = arc[-1], arc[-4]
+            d = (tip - prev) / max(np.hypot(*(tip - prev)), 1e-9)
+            n = np.array([-d[1], d[0]])
+            objs.append(to_fabric_path(
+                [tip - d * 9 + n * 5, tip, tip - d * 9 - n * 5], COND_COLOR, stroke_width))
+
+    return objs
+
+
+def node_marker(cx, cy, r=4):
+    """節点を表す小さなひし形（クリック入力の circle と区別するため path で描く）"""
+    return to_fabric_path(
+        [[cx, cy - r], [cx + r, cy], [cx, cy + r], [cx - r, cy], [cx, cy - r]],
+        NODE_COLOR, 2)
+
+
+def render_objects(stroke_width, show_nodes=True):
+    """キャンバスに読み込ませる図形リストを組み立てる"""
+    objs = []
+    for p in st.session_state.prims:
+        color = LINE_COLOR if p["type"] == "線分" else ARC_COLOR
+        objs.append(to_fabric_path(primitive_xy(p), color, stroke_width))
+
+    node_df = st.session_state.node_df
+    input_df = conditions_to_df(st.session_state.conditions, node_df, NODE_TOL)
+    objs.extend(cond_symbols(node_df, input_df, stroke_width))
+
+    if show_nodes:
+        for _, r in node_df.iterrows():
+            cx, cy = to_canvas(np.array([r["x"], r["y"]], dtype=float))
+            objs.append(node_marker(cx, cy))
+
+    return {"version": "4.4.0", "objects": objs}
+
+
+def refresh(stroke_width, show_nodes):
+    """モデルを組み直してキャンバスを描き直す"""
+    st.session_state.node_df, st.session_state.line_df = build_frame(
+        st.session_state.prims, NODE_TOL
+    )
+    st.session_state.drawing = render_objects(stroke_width, show_nodes)
+    st.session_state.n_shapes = len(st.session_state.drawing["objects"])
+    st.session_state.canvas_id += 1
+
+
+# ==========================================================
+# 応力図の作図
+# ==========================================================
+def diagram_figure(dfs, node_df, line_df, key, mag, scale, title):
+    """N図 / Q図 / M図 / 変形図を matplotlib で描く
+
+    key : "N" / "Q" / "M" / "deform"
+    mag : 表示倍率（px）
+    """
+    fig, ax = plt.subplots(figsize=(6.4, 4.4), dpi=130)
+
+    # --- 骨組み（灰色） ---
+    for _, r in line_df.iterrows():
+        p = node_df[node_df["No"] == r["s_node"]][["x", "y"]].values[0].astype(float)
+        q = node_df[node_df["No"] == r["e_node"]][["x", "y"]].values[0].astype(float)
+        ax.plot([p[0], q[0]], [p[1], q[1]], color="0.55", lw=1.6, zorder=2)
+
+    if key == "deform":
+        vmax = max((float(np.max(np.hypot(d["dx"], d["dy"]))) for d in dfs if len(d)), default=0.0)
+        for d in dfs:
+            if len(d) == 0:
+                continue
+            # 骨組みはpx、変位はmなので、それぞれ単位を揃えてから足す
+            k = (mag / vmax) if vmax > 0 else 0.0
+            ax.plot(d["x"] / scale + d["dx"] * k, d["y"] / scale + d["dy"] * k,
+                    color="#d62728", lw=2.0, zorder=3)
+        ax.set_title(f"{title}   (max disp = {vmax:.4g} m)", fontsize=10)
+    else:
+        vmax = max((float(np.max(np.abs(d[key]))) for d in dfs if len(d)), default=0.0)
+        k = (mag / vmax) if vmax > 0 else 0.0
+
+        pos_color = {"N": "#d62728", "Q": "#1f77b4", "M": "#2ca02c"}[key]
+        neg_color = {"N": "#1f77b4", "Q": "#ff7f0e", "M": "#9467bd"}[key]
+
+        for d in dfs:
+            if len(d) == 0:
+                continue
+            base = np.column_stack([d["x"].values, d["y"].values]) / scale
+            ang = math.atan2(base[-1, 1] - base[0, 1], base[-1, 0] - base[0, 0])
+            normal = np.array([-math.sin(ang), math.cos(ang)])   # 部材直交方向
+
+            v = d[key].values
+            # M は下側引張が正なので、正の値を材の下側（-法線側）に描く
+            off = base + np.outer(-v * k if key == "M" else v * k, normal)
+
+            for i in range(len(base) - 1):
+                poly = np.array([base[i], base[i + 1], off[i + 1], off[i]])
+                vm = (v[i] + v[i + 1]) / 2
+                ax.fill(poly[:, 0], poly[:, 1], color=pos_color if vm >= 0 else neg_color,
+                        alpha=0.30, lw=0, zorder=1)
+            ax.plot(off[:, 0], off[:, 1], color="0.2", lw=1.2, zorder=3)
+
+        unit = "kN" if key in ("N", "Q") else "kN·m"
+        ax.set_title(f"{title}   (max |{key}| = {vmax:.4g} {unit})", fontsize=10)
+
+    ax.set_aspect("equal")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for s in ax.spines.values():
+        s.set_color("0.85")
+    ax.margins(0.18)
+    fig.tight_layout()
+    return fig
+
+
+# ==========================================================
+# UI
+# ==========================================================
+st.sidebar.header("操作")
+op_mode = st.sidebar.radio("操作モード", ["描画", "条件入力", "移動"], horizontal=True)
+cond_kind = st.sidebar.radio(
+    "入力する条件",
+    ["ピン支点", "ローラー支点", "固定支点", "集中荷重", "モーメント荷重", "条件を消す"],
+    disabled=(op_mode != "条件入力"),
+)
+
+st.sidebar.header("清書のパラメータ")
+epsilon = st.sidebar.slider("epsilon（RDPの閾値）", 0.0, 50.0, 5.0, 0.1)
+tol = st.sidebar.slider("あてはめ許容誤差 (px)", 0.5, 30.0, 5.0, 0.5)
+NODE_TOL = st.sidebar.slider("節点をまとめる距離 (px)", 1, 60, 18)
+stroke_width = st.sidebar.slider("線の太さ", 1, 10, 3)
+show_nodes = st.sidebar.checkbox("節点を表示", True)
+auto = st.sidebar.checkbox("描き終わったら自動で清書", True)
+
+st.sidebar.header("解析条件")
+scale = st.sidebar.number_input("縮尺 (m/px)", 0.001, 1.0, 0.02, 0.001, format="%.3f")
+E = st.sidebar.number_input("ヤング係数 E (kN/m²)", 1.0, 1e12, 2.05e8, format="%.3e")
+A = st.sidebar.number_input("断面積 A (m²)", 1e-6, 10.0, 1.0e-2, format="%.3e")
+I = st.sidebar.number_input("断面二次モーメント I (m⁴)", 1e-12, 10.0, 1.0e-4, format="%.3e")
+P = st.sidebar.number_input("集中荷重の大きさ P (kN)", 0.0, 1e6, 10.0)
+load_ang = st.sidebar.number_input("集中荷重の向き (°: 0=右, 90=上)", -360.0, 360.0, 270.0, 15.0)
+roller_ang = st.sidebar.number_input("ローラーの傾き s_ang (°: 0=鉛直拘束)", -180.0, 180.0, 0.0, 15.0,
+                                     help="節点座標系ごと傾けて傾斜ローラーにします")
+M0 = st.sidebar.number_input("モーメント荷重 M (kN·m)", 0.0, 1e6, 10.0)
+div = st.sidebar.slider("部材の分割数", 2, 50, 20)
+mag = st.sidebar.slider("応力図の表示倍率 (px)", 10, 200, 60, 5)
+
+# セッション状態の初期化
+st.session_state.setdefault("drawing", None)      # キャンバスに読み込ませる図形
+st.session_state.setdefault("canvas_id", 0)       # 図形を差し替えるためのキー
+st.session_state.setdefault("n_shapes", 0)        # 描き込み済みオブジェクト数
+st.session_state.setdefault("prims", [])          # 清書済みの図形
+st.session_state.setdefault("conditions", [])     # 支点・荷重（座標で保持）
+if "node_df" not in st.session_state:
+    st.session_state.node_df = pd.DataFrame(columns=["No", "x", "y"])
+    st.session_state.line_df = pd.DataFrame(columns=["s_node", "e_node"])
+
+c1, c2, c3 = st.columns([1, 1, 4])
+if c1.button("消去"):
+    st.session_state.prims = []
+    st.session_state.conditions = []
+    refresh(stroke_width, show_nodes)
+    st.rerun()
+if c2.button("条件のみ消去"):
+    st.session_state.conditions = []
+    refresh(stroke_width, show_nodes)
+    st.rerun()
+
+if op_mode == "条件入力":
+    st.info("キャンバス上の節点（赤いひし形）付近をクリックすると、選んだ条件が入力されます。")
+
+canvas_mode = {"描画": "freedraw", "条件入力": "point", "移動": "transform"}[op_mode]
+
+# キャンバスの設定
+canvas_result = st_canvas(
+    fill_color="rgba(0, 0, 0, 0)",   # 塗りつぶしなし
+    stroke_width=stroke_width,       # 線の太さ
+    stroke_color="#000000",          # 手書き線の色
+    background_color="#FFFFFF",      # 背景色
+    background_image=None,           # 背景画像（なし）
+    update_streamlit=True,           # Streamlitをリアルタイムで更新
+    width=CANVAS_W,
+    height=CANVAS_H,
+    drawing_mode=canvas_mode,        # 描画モード
+    point_display_radius=4,
+    initial_drawing=st.session_state.drawing,
+    key=f"canvas_{st.session_state.canvas_id}",
+)
+
+objects = (canvas_result.json_data or {}).get("objects", [])
+
+# ---- 描画モード：新しいストロークを清書して図形リストに足す ----
+if op_mode == "描画" and auto and len(objects) > st.session_state.n_shapes:
+    for obj in objects[st.session_state.n_shapes:]:
+        if str(obj.get("type", "")).lower() != "path":
+            continue
+        pts = path_to_points(obj.get("path", []))
+        if len(pts) < 2:
+            continue
+        _, prims = segment_stroke(pts, epsilon, tol)
+        # 清書の一部として、線分の角度を15°刻みに自動調整する
+        prims = snap_line_angles(prims, ANGLE_STEP, close_tol=NODE_TOL * 1.5)
+        st.session_state.prims.extend(prims)
+    refresh(stroke_width, show_nodes)
+    st.rerun()
+
+# ---- 条件入力モード：クリック位置に一番近い節点へ条件を入れる ----
+if op_mode == "条件入力":
+    clicks = [o for o in objects if str(o.get("type", "")).lower() == "circle"]
+    if clicks:
+        o = clicks[-1]
+        r = float(o.get("radius", 4)) * float(o.get("scaleX", 1) or 1)
+        p = to_math([float(o["left"]) + r, float(o["top"]) + r])
+        no = nearest_node(st.session_state.node_df, p, max(NODE_TOL, 20))
+
+        if no is not None:
+            nd = st.session_state.node_df
+            xy = nd[nd["No"] == no][["x", "y"]].values[0].astype(float)
+            cond = next((c for c in st.session_state.conditions
+                         if np.hypot(c["x"] - xy[0], c["y"] - xy[1]) <= NODE_TOL), None)
+            if cond is None:
+                cond = {"x": float(xy[0]), "y": float(xy[1])}
+                cond.update(BLANK_COND)
+                st.session_state.conditions.append(cond)
+
+            if cond_kind == "ピン支点":
+                cond["stick"] = 0 if cond["stick"] == 1 else 1
+            elif cond_kind == "ローラー支点":
+                cond["stick"] = 0 if cond["stick"] == 2 else 2
+                cond["s_ang"] = float(roller_ang) % 360
+            elif cond_kind == "固定支点":
+                cond["stick"] = 0 if cond["stick"] == 3 else 3
+            elif cond_kind == "集中荷重":
+                cond["point"] = 0 if cond["point"] == 1 else 1
+                cond["point_ang"] = float(load_ang) % 360
+            elif cond_kind == "モーメント荷重":
+                if cond["moment"] == 0:
+                    cond["moment"], cond["moment_dir"] = 1, 0
+                elif cond["moment_dir"] == 0:
+                    cond["moment_dir"] = 1
+                else:
+                    cond["moment"] = 0
+            elif cond_kind == "条件を消す":
+                cond.update(BLANK_COND)
+
+            st.session_state.conditions = [
+                c for c in st.session_state.conditions
+                if any(c[k] for k in ("stick", "point", "moment"))
+            ]
+
+        refresh(stroke_width, show_nodes)
+        st.rerun()
+
+
+# ==========================================================
+# 判定結果 / モデルの表示
+# ==========================================================
+node_df, line_df = st.session_state.node_df, st.session_state.line_df
+input_df = conditions_to_df(st.session_state.conditions, node_df, NODE_TOL)
+prims = st.session_state.prims
+
+if prims:
+    with st.expander(f"清書の判定結果：{len(prims)} 個の図形", expanded=False):
+        rows = []
+        for k, p in enumerate(prims, 1):
+            if p["type"] == "線分":
+                detail = f"長さ {p['length']:.1f} px"
+            else:
+                detail = f"半径 {p['radius']:.1f} px / 中心角 {abs(np.degrees(p['a1'] - p['a0'])):.0f}°"
+            rows.append({
+                "#": k, "種類": p["type"],
+                "始点": f"({p['start'][0]:.0f}, {p['start'][1]:.0f})",
+                "終点": f"({p['end'][0]:.0f}, {p['end'][1]:.0f})",
+                "詳細": detail, "最大誤差(px)": round(p["error"], 2),
+            })
+        st.dataframe(rows, hide_index=True, use_container_width=True)
+else:
+    st.info("キャンバスに線を描いてください。描き終わると自動で清書されます。")
+
+col1, col2 = st.columns(2)
+with col1:
+    st.subheader(f"節点 {len(node_df)} / 部材 {len(line_df)}")
+    if len(node_df) > 0:
+        view = node_df.copy()
+        view["支点"] = view["No"].map(
+            {int(r["No"]): STICK_NAME[int(r["stick"])] for _, r in input_df.iterrows()}
+        ).fillna("-")
+        view["荷重"] = view["No"].map({
+            int(r["No"]): ", ".join(
+                ([f"P={P:g}kN @{r['point_ang']:.0f}°"] if r["point"] == 1 else [])
+                + ([f"M={M0:g}kN·m"] if r["moment"] == 1 else [])
+            ) for _, r in input_df.iterrows()
+        }).fillna("")
+        st.dataframe(view.round(1), hide_index=True, use_container_width=True)
+with col2:
+    st.subheader("部材")
+    st.dataframe(line_df, hide_index=True, use_container_width=True)
+
+# ==========================================================
+# 応力図（N・Q・M）
+# ==========================================================
+st.header("応力図")
+st.caption(f"FEM: {FEM_SOURCE}")
+
+n_stick = int((input_df["stick"] != 0).sum()) if len(input_df) else 0
+n_load = int(((input_df["point"] != 0) | (input_df["moment"] != 0)).sum()) if len(input_df) else 0
+
+if len(line_df) == 0:
+    st.info("部材がありません。線分を描いてください（円弧は解析対象外です）。")
+elif n_stick == 0 or n_load == 0:
+    st.warning(f"支点 {n_stick} 個・荷重 {n_load} 個です。"
+               "「条件入力」モードで支点と荷重をそれぞれ1つ以上入力してください。")
+else:
+    elements_df, nodes_df = make_dfs(node_df, line_df, input_df, E, A, I, scale, P, M0)
+    try:
+        dfs = solve(elements_df, nodes_df, div=div)
+    except UnstableStructure as e:
+        dfs = None
+        st.error(f"解析できませんでした：{e}")
+    except Exception as e:
+        dfs = None
+        st.error(f"FEMプログラムでエラーが発生しました：{e}")
+
+    if dfs:
+        t1, t2, t3, t4 = st.tabs(["曲げモーメント図 M", "せん断力図 Q", "軸力図 N", "変形図"])
+        for tab, key, title in [
+            (t1, "M", "Bending moment M"),
+            (t2, "Q", "Shear force Q"),
+            (t3, "N", "Axial force N"),
+            (t4, "deform", "Deformation"),
+        ]:
+            with tab:
+                fig = diagram_figure(dfs, node_df, line_df, key, mag, scale, title)
+                st.pyplot(fig, use_container_width=True)
+                plt.close(fig)
+
+        cA, cB = st.columns(2)
+        with cA:
+            st.subheader("部材端の応力")
+            rows = []
+            for i, d in enumerate(dfs):
+                if len(d) == 0:
+                    continue
+                r = elements_df.iloc[i]
+                rows.append({
+                    "部材": f"{int(r['start'])}→{int(r['end'])}",
+                    "長さ(m)": round(float(r["length"]), 3),
+                    "N始(kN)": round(float(d["N"].iloc[0]), 2),
+                    "N終(kN)": round(float(d["N"].iloc[-1]), 2),
+                    "Q始(kN)": round(float(d["Q"].iloc[0]), 2),
+                    "Q終(kN)": round(float(d["Q"].iloc[-1]), 2),
+                    "M始(kN·m)": round(float(d["M"].iloc[0]), 2),
+                    "M終(kN·m)": round(float(d["M"].iloc[-1]), 2),
+                })
+            st.dataframe(rows, hide_index=True, use_container_width=True)
+        with cB:
+            st.subheader("反力")
+            rea = dfs[0].attrs.get("reactions")
+            if rea is not None:
+                rea = rea[(rea[["Rx", "Ry", "Rm"]].abs().sum(axis=1) > 1e-9)]
+                st.dataframe(rea.round(3), hide_index=True, use_container_width=True)
+            else:
+                st.write("反力データがありません（FEMプログラムの戻り値に含まれていません）。")
+
+        with st.expander("FEMプログラムへ渡したデータ"):
+            st.write("elements_df")
+            st.dataframe(elements_df.round(4), hide_index=True, use_container_width=True)
+            st.write("nodes_df")
+            st.dataframe(nodes_df.round(4), hide_index=True, use_container_width=True)
+
+with st.expander("描画結果のJSONデータ"):
+    st.json(canvas_result.json_data)
+import streamlit as st
+from streamlit_drawable_canvas import st_canvas
+
+matplotlib.use("Agg")
+
+FEM_SOURCE = "main.py のFEMプログラムを移植（本ファイル内に実装）"
+
+
+# =========================================
+# ------------- FEM section ---------------
+#       モーメント : 反時計回りが正 /  x : 右向きが正 /  y : 上向きが正
+# =========================================
+class UnstableStructure(Exception):
+    """全体剛性マトリクスが特異＝不安定な構造"""
+
+def make_T3(angle, s_ang, e_ang):
+    """変換マトリクス作成
+
+    angle        : 部材角度
+    s_ang, e_ang : 節点角度（傾斜ローラーなど、節点座標系を傾けるための角度）
+    u_local = T3 @ u_節点座標系
+    """
+    s_dash = float(s_ang) - float(angle)
+    e_dash = float(e_ang) - float(angle)
+
+    sin_s, cos_s = math.sin(math.radians(s_dash)), math.cos(math.radians(s_dash))
+    sin_e, cos_e = math.sin(math.radians(e_dash)), math.cos(math.radians(e_dash))
+
+    return np.array([
+        [cos_s, -sin_s, 0.0,   0.0,    0.0, 0.0],
+        [sin_s,  cos_s, 0.0,   0.0,    0.0, 0.0],
+        [  0.0,    0.0, 1.0,   0.0,    0.0, 0.0],
+        [  0.0,    0.0, 0.0, cos_e, -sin_e, 0.0],
+        [  0.0,    0.0, 0.0, sin_e,  cos_e, 0.0],
+        [  0.0,    0.0, 0.0,   0.0,    0.0, 1.0],
+    ])
+
+
+def esm(E, A, I, L, angle, s_ang, e_ang):
+    """要素剛性マトリクス（全体座標系）"""
+    matrix_L = np.array([
+        [ (E * A) / L,                0.0,               0.0, -(E * A) / L,                0.0,               0.0],
+        [         0.0,  (12 * E * I) / L**3,  (6 * E * I) / L**2,          0.0, -(12 * E * I) / L**3,  (6 * E * I) / L**2],
+        [         0.0,   (6 * E * I) / L**2,     (4 * E * I) / L,          0.0,  -(6 * E * I) / L**2,     (2 * E * I) / L],
+        [-(E * A) / L,                0.0,               0.0,  (E * A) / L,                0.0,               0.0],
+        [         0.0, -(12 * E * I) / L**3, -(6 * E * I) / L**2,          0.0,  (12 * E * I) / L**3, -(6 * E * I) / L**2],
+        [         0.0,   (6 * E * I) / L**2,     (2 * E * I) / L,          0.0,  -(6 * E * I) / L**2,     (4 * E * I) / L],
+    ])
+
+    matrix_T3 = make_T3(angle, s_ang, e_ang)
+    return matrix_T3.T @ matrix_L @ matrix_T3
+
+
+def gsm(matrixs, n_node):
+    """全体剛性マトリクス作成
+
+    ★ main.py は節点番号の最大値から行列サイズを決めていたので、
+       欠番があると大きさが合わない。節点数を引数で受け取るように変更した。
+    """
+    matrix = np.zeros((n_node * 3, n_node * 3))
+    for m in matrixs:
+        s, e = m[1], m[2]
+        ind = [s * 3, s * 3 + 1, s * 3 + 2, e * 3, e * 3 + 1, e * 3 + 2]
+        matrix[np.ix_(ind, ind)] += m[0]
+    return matrix
+
+
+def load_direction(angle):
+    """分布荷重を全体座標の x, y 成分に分解するための係数
+
+    ★ main.py は d_l と member_stress で angle == 360 の扱いが食い違っていたので、
+       角度を 0〜360 に正規化して1か所にまとめた。
+    """
+    x = round(math.sin(math.radians(angle)), 3)
+    y = round(math.cos(math.radians(angle)), 3)
+
+    a = float(angle) % 360
+    if 0 <= a < 90:
+        x = -x
+    elif 90 <= a < 180:
+        x, y = -x, -y
+    elif 180 <= a < 270:
+        y = -y
+    else:
+        x = -x
+    return x, y
+
+
+def d_l(e_l, n_node):
+    """分布荷重のために加算する要素を作成
+
+    ★ main.py は dict の挿入順に値を並べていたため、部材が節点番号順に並んでいないと
+       荷重ベクトルが別の節点にずれて入ってしまう（荷重のかからない節点が飛ばされる）。
+       節点番号でそのまま加算する形に変更した。
+    """
+    dl = np.zeros(n_node * 3)
+
+    for i in e_l:
+        length, angle, Ws, We, start, end = i[6], i[3], i[4], i[5], i[1], i[2]
+        if Ws == 0 and We == 0:
+            continue
+
+        x, y = load_direction(angle)
+
+        Qxs = (length / 20) * (7 * Ws * x + 3 * We * x)   # 各要素の応力算出
+        Qxe = (length / 20) * (3 * Ws * x + 7 * We * x)
+        Qys = (length / 20) * (7 * Ws * y + 3 * We * y)
+        Qye = (length / 20) * (3 * Ws * y + 7 * We * y)
+        Ms = (length**2 / 60) * (3 * Ws + 2 * We)
+        Me = -(length**2 / 60) * (2 * Ws + 3 * We)
+
+        dl[start * 3 : start * 3 + 3] += [Qxs, Qys, Ms]
+        dl[end * 3 : end * 3 + 3] += [Qxe, Qye, Me]
+
+    return dl
+
+
+def d_r(e_l, n_d):
+    """各節点の変位・反力計算
+
+    e_l : element_list
+    n_d : nodes_df
+    """
+    n_node = len(n_d)
+    matrix = gsm(e_l, n_node)              # 全体剛性マトリクス作成
+    dl = d_l(e_l, n_node)                  # 分布荷重考慮
+
+    rc = n_d[["rc_x", "rc_y", "rc_m"]].values.astype(float)   # 拘束条件
+    ef = n_d[["ef_x", "ef_y", "ef_m"]].values.astype(float)   # 外力条件
+    s_angs = n_d["s_ang"].values.astype(float)
+
+    # ★ 傾斜支持節点では拘束方向が傾いているので、外力も節点座標系に回してから解く
+    #    （main.py は外力を全体座標系のまま扱っていた）
+    for i, sa in enumerate(s_angs):
+        if sa != 0:
+            c, s = math.cos(math.radians(sa)), math.sin(math.radians(sa))
+            fx, fy = ef[i, 0], ef[i, 1]
+            ef[i, 0], ef[i, 1] = fx * c + fy * s, -fx * s + fy * c
+
+    matrix_ind = matrix.shape[0]
+    rc_ind = [3 * r + c for r in range(n_node) for c in range(3) if rc[r][c] == 1]
+    ef_ind = [i for i in range(matrix_ind) if i not in set(rc_ind)]
+
+    if not ef_ind:
+        raise UnstableStructure("すべての自由度が拘束されています。")
+
+    aa = dl[ef_ind]
+    ba = dl[rc_ind]
+
+    Kaa = matrix[np.ix_(ef_ind, ef_ind)]
+    Kba = matrix[np.ix_(rc_ind, ef_ind)]
+
+    # ★ main.py は pinv で解いていて、不安定な構造でも「それらしい」解を返してしまう。
+    #    ランクを見て不安定を検出してから解く
+    if np.linalg.matrix_rank(Kaa) < len(ef_ind):
+        raise UnstableStructure("剛性マトリクスが特異です。支点が不足しているか、構造が不安定です。")
+
+    Pa = ef.flatten()[ef_ind] - aa         # 計算に必要な外力条件
+    Ua = np.linalg.pinv(Kaa) @ Pa          # 移動する節点の変位
+    Pb = (Kba @ Ua) + ba                   # 支点反力
+
+    U = np.zeros(matrix_ind)
+    U[ef_ind] = Ua
+    P = np.zeros(matrix_ind)
+    P[ef_ind] = ef.flatten()[ef_ind]
+    P[rc_ind] = Pb
+
+    R = np.zeros(matrix_ind)   # 反力だけを取り出したベクトル（拘束していないDOFは0）
+    R[rc_ind] = Pb
+
+    # 傾斜支持節点の変位・力を、節点座標系から全体座標系に戻す
+    # （main.py の「傾斜支持節点処理」と同じ内容を、節点ごとに1回だけ行う形にした）
+    for i, sa in enumerate(s_angs):
+        if sa != 0:
+            c, s = math.cos(math.radians(sa)), math.sin(math.radians(sa))
+            for vec in (U, P, R):
+                a, b = vec[3 * i], vec[3 * i + 1]
+                vec[3 * i], vec[3 * i + 1] = a * c - b * s, a * s + b * c
+
+    # 各節点の変位と力をdfにまとめる
+    df = pd.DataFrame(
+        np.column_stack([P.reshape(-1, 3), U.reshape(-1, 3), R.reshape(-1, 3)]),
+        columns=["Px", "Py", "M", "u", "v", "theta", "Rx", "Ry", "Rm"],
+    ).astype(float)
+    df.insert(0, "No", n_d["No"].values)
+    return df
+
+
+def member_stress(e_l, D_R, n_d, div):
+    """部材応力計算
+
+    e_l : element_list
+    D_R : 各節点の変位・反力df
+    n_d : nodes_df
+    div : 部材の分割数（★ main.py は step 幅の整数ループだったため、
+          部材長が小さい／整数でないと終点まで届かない。分割数指定に変更した）
+    """
+    node = n_d[["x", "y"]].values.astype(float)
+
+    disp_df_list = []
+    for i in e_l:
+        length, angle = i[6], i[3]
+        Ws, We = i[4], i[5]
+        E, A, I = i[9], i[10], i[11]
+
+        sin = math.sin(math.radians(angle))
+        cos = math.cos(math.radians(angle))
+
+        x, y = load_direction(angle)                 # 力をx, yに分解
+
+        Qxs = (length / 20) * (7 * Ws * x + 3 * We * x)
+        Qxe = (length / 20) * (3 * Ws * x + 7 * We * x)
+        Qys = (length / 20) * (7 * Ws * y + 3 * We * y)
+        Qye = (length / 20) * (3 * Ws * y + 7 * We * y)
+        # ★ main.py はここだけ Ms, Me の符号が d_l と逆になっていて、
+        #    分布荷重を入れると M 図が一定値だけ上下にずれる（Q 図・変形図は正しい）。
+        #    d_l と同符号にそろえる
+        Ms = (length**2 / 60) * (3 * Ws + 2 * We)
+        Me = -(length**2 / 60) * (2 * Ws + 3 * We)
+
+        if Ws != 0 or We != 0:
+            Wxy = [-Ws * x, -Ws * y, 1, -We * x, -We * y, 1]
+        else:
+            Wxy = [0, 0, 0, 0, 0, 0]
+
+        # 全体座標系の要素剛性マトリクスを新たに生成する
+        # ★ main.py はここで E, A, I を定数で書いていて elements_df の値が無視されていた
+        Kg = esm(E, A, I, length, angle, 0, 0)
+        UV = D_R[["u", "v", "theta"]]                 # 節点変位(基準座標・全体座標系)
+        Ug = UV.iloc[i[1]].values.tolist() + UV.iloc[i[2]].values.tolist()
+        Fg_G = (Kg @ Ug) + np.array([Qxs, Qys, Ms, Qxe, Qye, Me])   # 部材応力(基準座標)
+
+        T3 = make_T3(angle, 0, 0)                    # 変換マトリクス
+        Fg_L = (T3 @ Fg_G).tolist()                  # 部材応力(局所座標)
+        Fg_L = [Fg_L[0], Fg_L[1], -Fg_L[2], Fg_L[3], -Fg_L[4], Fg_L[5]]  # 正負の整合を整理
+        Wuv = T3 @ np.array(Wxy, dtype=float)
+
+        # 変形・応力算出
+        start = node[i[1]]                           # 部材の始点座標[x, y]
+        d_list = UV.iloc[[i[1], i[2]]].values.tolist()
+        Us, Vs, Ts = d_list[0]                       # start節点の変位・回転角(標準座標)
+        Ue, Ve, Te = d_list[1]                       # end節点の変位・回転角(標準座標)
+
+        Us_l, Vs_l = Us * cos + Vs * sin, -Us * sin + Vs * cos   # start節点の変位(局所座標)
+        Ue_l, Ve_l = Ue * cos + Ve * sin, -Ue * sin + Ve * cos   # end節点の変位(局所座標)
+
+        disp_list = []
+        for xd in np.linspace(0.0, length, int(div) + 1):
+            Ux = (1 - xd / length) * Us_l + (xd / length) * Ue_l          # 材軸方向の変位
+            Vx = np.array([
+                1 - 3 * xd**2 / length**2 + 2 * xd**3 / length**3,
+                xd - 2 * xd**2 / length + xd**3 / length**2,
+                3 * xd**2 / length**2 - 2 * xd**3 / length**3,
+                -1 * xd**2 / length + xd**3 / length**2,
+            ]) @ [Vs_l, Ts, Ve_l, Te]                                     # 材軸直交方向の変位
+
+            if Ws != 0 or We != 0:
+                # ★ 分布荷重による部材内の付加たわみ（両端固定梁の特解）。
+                #    main.py は節点変位の補間だけなので、分布荷重時にたわみが小さく出る
+                w = (Wuv[1] + Wuv[4]) / 2
+                Vx += w * xd**2 * (length - xd) ** 2 / (24 * E * I)
+
+            dx = Ux * cos - Vx * sin                 # x方向変位(標準座標)
+            dy = Ux * sin + Vx * cos                 # y方向変位(標準座標)
+
+            c_x = xd * cos + start[0]                # 移動前地点の座標
+            c_y = xd * sin + start[1]
+
+            # 軸方向力・せん断力・モーメント
+            N = -(Wuv[3] - Wuv[0]) / 2 * xd**2 / length - Wuv[0] * xd + Fg_L[0]
+            Q = (Wuv[4] - Wuv[1]) / 2 * xd**2 / length + Wuv[1] * xd + Fg_L[1]
+            M = ((Wuv[4] - Wuv[1]) / 6 * xd**3 / length + Wuv[1] / 2 * xd**2
+                 + Fg_L[1] * xd + Fg_L[2])
+
+            # ★ main.py の N は圧縮が正。ここでは引張を正にそろえる
+            disp_list.append([xd, c_x, c_y, dx, dy, -N, Q, M])
+
+        disp_df_list.append(pd.DataFrame(
+            np.array(disp_list),
+            columns=["delta", "x", "y", "dx", "dy", "N", "Q", "M"],
+        ))
+
+    return disp_df_list
+
+
+def fem_calc(elements_df, nodes_df, div=20):
+    """FEM解析プログラム
+
+    elements_df : 部材df（young, area, s_moment, length, angle, start, end, Ws, We）
+    nodes_df    : 節点df（No, x, y, rc_x, rc_y, rc_m, ef_x, ef_y, ef_m, s_ang）
+    """
+    nodes_df = nodes_df.reset_index(drop=True)
+    elements_df = elements_df.reset_index(drop=True)
+
+    # 節点番号 → 行番号（欠番があっても動くように）
+    idx = {int(no): i for i, no in enumerate(nodes_df["No"].tolist())}
+
+    # elements_list = [esm, start, end, angle, Ws, We, length, s_ang, e_ang, E, A, I]
+    elements_list = []
+    for _, r in elements_df.iterrows():
+        s, e = idx[int(r["start"])], idx[int(r["end"])]
+        s_ang = float(nodes_df["s_ang"].iloc[s])            # 始点節点角度
+        e_ang = float(nodes_df["s_ang"].iloc[e])            # 終点節点角度
+        E, A, I = float(r["young"]), float(r["area"]), float(r["s_moment"])
+        L, ang = float(r["length"]), float(r["angle"])
+
+        elements_list.append([
+            esm(E, A, I, L, ang, s_ang, e_ang), s, e, ang,
+            float(r["Ws"]), float(r["We"]), L, s_ang, e_ang, E, A, I,
+        ])
+
+    D_R = d_r(elements_list, nodes_df)                      # 各節点の変位・反力計算
+    M_S = member_stress(elements_list, D_R, nodes_df, div)  # 部材応力計算
+
+    return D_R, M_S
+
+
+def solve(elements_df, nodes_df, div=20):
+    """作図側が使うための入口。部材ごとの応力・変位dfのリストを返す"""
+    if len(elements_df) == 0 or len(nodes_df) == 0:
+        return []
+
+    D_R, M_S = fem_calc(elements_df, nodes_df, div)
+
+    reactions = D_R[["No", "Rx", "Ry", "Rm"]].copy()
+
+    for d in M_S:
+        d.attrs["reactions"] = reactions
+        d.attrs["D_R"] = D_R
+    return M_S
+
+# Streamlit app タイトル
+st.set_page_config(page_title="図形描画デモ", layout="wide")
+st.title("図形描画デモ")
+st.caption("手描き線をRDP法で簡略化して「線分」「円弧」に判定し、線分の角度を15°刻みに整えたうえで骨組みとして応力図（N・Q・M）を描きます。")
+
+CANVAS_W, CANVAS_H = 700, 450
+
+LINE_COLOR = "#1f77b4"   # 線分
+ARC_COLOR = "#2ca02c"    # 円弧
+NODE_COLOR = "#d62728"   # 節点
+COND_COLOR = "#7f4fbf"   # 支点・荷重
+
+
+# ==========================================================
+# 座標取得（fabric.js のパス → 点列）
+# ==========================================================
+def quad_bezier(p0, p1, p2, n=8):
+    """2次ベジェ曲線を n 点にサンプリングする"""
+    t = np.linspace(0.0, 1.0, n)[:, None]
+    p0, p1, p2 = np.array(p0, float), np.array(p1, float), np.array(p2, float)
+    return (1 - t) ** 2 * p0 + 2 * (1 - t) * t * p1 + t**2 * p2
+
+
+def path_to_points(path):
+    """
+    fabric.js のパス命令を (x, y) の点列に変換する。
+    freedraw は ["M",x,y] / ["Q",cx,cy,x,y] / ["L",x,y] を返すので、
+    命令ごとに引数の数が違う点に注意（Q の cmd[1],cmd[2] は制御点であって通過点ではない）。
+    """
+    pts, cur = [], None
+    for cmd in path:
+        op = cmd[0]
+        if op in ("M", "L"):
+            cur = [cmd[1], cmd[2]]
+            pts.append(cur)
+        elif op == "Q" and cur is not None:
+            seg = quad_bezier(cur, [cmd[1], cmd[2]], [cmd[3], cmd[4]])
+            pts.extend(seg[1:].tolist())
+            cur = [cmd[3], cmd[4]]
+        elif op == "C" and cur is not None:
+            cur = [cmd[5], cmd[6]]
+            pts.append(cur)
+
+    if len(pts) < 2:
+        return np.zeros((0, 2))
+
+    pts = np.asarray(pts, dtype=float)
+    # 連続する重複点を除去（重複があるとRDPでゼロ除算が起きる）
+    keep = np.ones(len(pts), dtype=bool)
+    keep[1:] = np.hypot(pts[1:, 0] - pts[:-1, 0], pts[1:, 1] - pts[:-1, 1]) > 1e-9
+    return pts[keep]
+
+
+# ==========================================================
+# RDP法アルゴリズム
+# ==========================================================
+def perpendicular_distance(point, start, end):
+    """直線 start-end と点 point の距離を計算する"""
+    x, y = point[0], point[1]
+    x1, y1 = start[0], start[1]
+    x2, y2 = end[0], end[1]
+
+    denom = np.hypot(y2 - y1, x2 - x1)
+    if denom == 0:
+        # start と end が同一点のときは点と点の距離を返す（ゼロ除算の回避）
+        return float(np.hypot(x - x1, y - y1))
+
+    return float(abs((y2 - y1) * x - (x2 - x1) * y + x2 * y1 - y2 * x1) / denom)
+
+
+def douglas_peucker(point_list, start, end, epsilon):
+    """point_list[start:end] を簡略化した点列を返す（end は含まない）"""
+    # 点が2個以下ならこれ以上簡略化できない（再帰の終了条件）
+    if end - start <= 1:
+        return [point_list[start]]
+    if end - start == 2:
+        return [point_list[start], point_list[end - 1]]
+
+    # 直線からの距離が最大の点を見つける
+    dmax, index = 0.0, start + 1
+    for i in range(start + 1, end - 1):
+        d = perpendicular_distance(point_list[i], point_list[start], point_list[end - 1])
+        if d > dmax:
+            index, dmax = i, d
+
+    # 最大距離が閾値を超えた場合、再帰的に処理する
+    if dmax > epsilon:
+        rec_results1 = douglas_peucker(point_list, start, index + 1, epsilon)
+        rec_results2 = douglas_peucker(point_list, index, end, epsilon)
+
+        # 結果を結合する（分岐点が重複するので先頭を除いて連結）
+        rec_results1.extend(rec_results2[1:])
+        return rec_results1
+    else:
+        return [point_list[start], point_list[end - 1]]
+
+
+def douglas_peucker_indices(points, epsilon):
+    """RDPで残る点の「添字」を返す（線分/円弧の判定で元の点列を参照するため）"""
+    n = len(points)
+    if n < 3:
+        return list(range(n))
+
+    keep = {0, n - 1}
+    stack = [(0, n - 1)]
+    while stack:  # 再帰の深さ制限に引っかからないようスタックで実装
+        s, e = stack.pop()
+        if e - s < 2:
+            continue
+        dmax, index = 0.0, -1
+        for i in range(s + 1, e):
+            d = perpendicular_distance(points[i], points[s], points[e])
+            if d > dmax:
+                dmax, index = d, i
+        if dmax > epsilon and index > 0:
+            keep.add(index)
+            stack.append((s, index))
+            stack.append((index, e))
+    return sorted(keep)
+
+
+# ==========================================================
+# 線分 / 円弧のあてはめ
+# ==========================================================
+def line_error(pts):
+    """両端を結ぶ直線からの最大ずれ"""
+    if len(pts) < 3:
+        return 0.0
+    return max(perpendicular_distance(p, pts[0], pts[-1]) for p in pts[1:-1])
+
+
+def fit_circle(pts):
+    """最小二乗による円あてはめ（Kasa法）。(cx, cy, r) を返す。失敗時は None"""
+    if len(pts) < 3:
+        return None
+    x, y = pts[:, 0], pts[:, 1]
+    A = np.column_stack([x, y, np.ones(len(x))])
+    b = x**2 + y**2
+    try:
+        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    cx, cy = sol[0] / 2.0, sol[1] / 2.0
+    val = sol[2] + cx**2 + cy**2
+    if not np.isfinite(val) or val <= 0:
+        return None
+    return float(cx), float(cy), float(np.sqrt(val))
+
+
+def arc_error(pts, circle):
+    """円からの最大ずれ"""
+    cx, cy, r = circle
+    return float(np.max(np.abs(np.hypot(pts[:, 0] - cx, pts[:, 1] - cy) - r)))
+
+
+def arc_angles(pts, circle):
+    """点列に沿って角度を連続化し、(開始角, 終了角) を返す"""
+    cx, cy, _ = circle
+    ang = np.unwrap(np.arctan2(pts[:, 1] - cy, pts[:, 0] - cx))
+    return float(ang[0]), float(ang[-1])
+
+
+def make_line(points, i0, i1):
+    sub = points[i0 : i1 + 1]
+    return {
+        "type": "線分", "i0": i0, "i1": i1,
+        "start": sub[0], "end": sub[-1],
+        "length": float(np.hypot(*(sub[-1] - sub[0]))),
+        "error": line_error(sub),
+    }
+
+
+def make_arc(points, i0, i1, circle):
+    sub = points[i0 : i1 + 1]
+    a0, a1 = arc_angles(sub, circle)
+    return {
+        "type": "円弧", "i0": i0, "i1": i1,
+        "center": (circle[0], circle[1]), "radius": circle[2],
+        "a0": a0, "a1": a1,
+        "error": arc_error(sub, circle),
+        "start": sub[0], "end": sub[-1],
+    }
+
+
+def merge_primitives(points, prims, tol):
+    """RDPの頂点が細かすぎて分断された図形を、同じ図形とみなせる範囲で結合する"""
+    merged = []
+    for p in prims:
+        if merged:
+            prev = merged[-1]
+            sub = points[prev["i0"] : p["i1"] + 1]
+
+            # 隣り合う線分どうしが1本の直線とみなせるなら結合
+            if prev["type"] == "線分" and p["type"] == "線分" and line_error(sub) <= tol * 1.5:
+                merged[-1] = make_line(points, prev["i0"], p["i1"])
+                continue
+
+            # 円弧に隣接する短い区間が同じ円に乗るなら円弧に吸収させる
+            if prev["type"] == "円弧" or p["type"] == "円弧":
+                c = fit_circle(sub)
+                if c is not None and arc_error(sub, c) <= tol * 1.5:
+                    merged[-1] = make_arc(points, prev["i0"], p["i1"], c)
+                    continue
+
+        merged.append(p)
+    return merged
+
+
+def segment_stroke(points, epsilon, tol):
+    """
+    ストロークを「線分」と「円弧」の列に分解する。
+    RDPで求めた頂点を切れ目の候補として、各位置から一番長く伸ばせる形状を貪欲に選ぶ。
+    """
+    idx = douglas_peucker_indices(points, epsilon)
+    prims = []
+
+    i = 0
+    while i < len(idx) - 1:
+        # --- 直線として何区間まで伸ばせるか ---
+        j_line = i + 1
+        for j in range(i + 1, len(idx)):
+            if line_error(points[idx[i] : idx[j] + 1]) <= tol:
+                j_line = j
+            else:
+                break
+
+        # --- 円弧として何区間まで伸ばせるか（円弧は最低2区間必要） ---
+        j_arc, arc_fit = i, None
+        for j in range(i + 2, len(idx)):
+            sub = points[idx[i] : idx[j] + 1]
+            c = fit_circle(sub)
+            if c is None:
+                break
+            span = float(np.hypot(*(sub[-1] - sub[0])))
+            # 半径が大きすぎる＝ほぼ直線なので円弧とはみなさない
+            # （20倍だと、ほぼまっすぐな部材まで円弧と判定されて骨組みから外れてしまう）
+            if c[2] > max(span, 1.0) * 5:
+                break
+            if arc_error(sub, c) <= tol:
+                j_arc, arc_fit = j, c
+            else:
+                break
+
+        # 長く説明できたほうを採用（同じなら線分を優先）
+        if j_arc > j_line and arc_fit is not None:
+            prims.append(make_arc(points, idx[i], idx[j_arc], arc_fit))
+            i = j_arc
+        else:
+            prims.append(make_line(points, idx[i], idx[j_line]))
+            i = j_line
+
+    return idx, merge_primitives(points, prims, tol)
+
+
+def primitive_xy(p, n=96):
+    """図形を描くための座標列を返す"""
+    if p["type"] == "線分":
+        return np.array([p["start"], p["end"]], dtype=float)
+    t = np.linspace(p["a0"], p["a1"], n)
+    cx, cy = p["center"]
+    return np.column_stack([cx + p["radius"] * np.cos(t), cy + p["radius"] * np.sin(t)])
+
+
+# ==========================================================
+# 部材角度の15°スナップ
+#   draw_lib.py の judg_poly と同じ考え方。
+#   1ストローク内で連続する線分をひとまとまり（多角線分）として扱い、
+#     ・端の線分は外側の端点を固定して回す
+#     ・間の線分は中点を中心に回す
+#   角度を15°刻みに丸めたあと、隣り合う線分の交点を取り直して節点をつなぎ直す。
+# ==========================================================
+ANGLE_STEP = 15                      # 角度調整のパラメータ（何度刻みに丸めるか）
+
+
+def line_angle(p, q):
+    """2点の角度を求める（0〜360度）"""
+    return math.degrees(math.atan2(q[1] - p[1], q[0] - p[0])) % 360
+
+
+def cross_point(p, u, q, v, fallback, limit):
+    """点p・方向uの直線と、点q・方向vの直線の交点
+
+    平行なとき、または交点が元の節点から limit 以上離れるときは fallback を返す。
+    """
+    den = u[0] * v[1] - u[1] * v[0]
+    if abs(den) < 1e-9:                       # 平行（丸めた結果、同じ角度になった）
+        return fallback
+
+    t = ((q[0] - p[0]) * v[1] - (q[1] - p[1]) * v[0]) / den
+    c = np.asarray(p, dtype=float) + t * np.asarray(u, dtype=float)
+    if float(np.hypot(*(c - fallback))) > limit:
+        return fallback
+    return c
+
+
+def _snap_chain(pts, step, close_tol):
+    """つながった折れ線の各辺の角度を step 度刻みに丸め、新しい節点列を返す"""
+    pts = [np.array(p, dtype=float) for p in pts]
+    n = len(pts) - 1                                  # 辺の数
+    angles = [(round(line_angle(pts[k], pts[k + 1]) / step) * step) % 360
+              for k in range(n)]
+
+    # 丸めた結果が同じ角度になった辺どうしは1本の直線としてまとめる
+    groups = []
+    for k in range(n):
+        if groups and angles[k] == angles[groups[-1][0]]:
+            groups[-1].append(k)
+        else:
+            groups.append([k])
+
+    new_pts = [None] * (n + 1)
+    lines = []                                        # 各グループの直線 (通る点, 方向ベクトル)
+
+    for gi, g in enumerate(groups):
+        a = math.radians(angles[g[0]])
+        u = np.array([math.cos(a), math.sin(a)])
+
+        idx = list(range(g[0], g[-1] + 2))            # このグループが持つ節点の添字
+        seg = [pts[i] for i in idx]
+        acc = [0.0]                                   # 元の折れ線に沿った累積長
+        for i in range(len(seg) - 1):
+            acc.append(acc[-1] + float(np.hypot(*(seg[i + 1] - seg[i]))))
+
+        if len(groups) == 1 or (gi > 0 and gi < len(groups) - 1):
+            anchor, s_a = (seg[0] + seg[-1]) / 2, acc[-1] / 2   # 間の辺は中点を中心に回す
+        elif gi == 0:
+            anchor, s_a = seg[0], 0.0                           # 始めの辺は始点を固定
+        else:
+            anchor, s_a = seg[-1], acc[-1]                      # 終わりの辺は終点を固定
+
+        for i, t in zip(idx, acc):
+            new_pts[i] = anchor + (t - s_a) * u
+        lines.append((anchor, u, acc[-1]))     # (通る点, 方向, グループの長さ)
+
+    # 角度の違う直線どうしは、交点を取り直して節点をつなぎ直す
+    for gi in range(len(groups) - 1):
+        j = groups[gi][-1] + 1
+        a, ua, la = lines[gi]
+        b, ub, lb = lines[gi + 1]
+        new_pts[j] = cross_point(a, ua, b, ub, new_pts[j], max(la, lb))
+
+    # 始点と終点が近ければ多角形とみなし、終わりの辺と始めの辺の交点で閉じる
+    if len(groups) > 2 and float(np.hypot(*(pts[0] - pts[-1]))) < close_tol:
+        a, ua, la = lines[-1]
+        b, ub, lb = lines[0]
+        mid = (new_pts[0] + new_pts[-1]) / 2
+        c = cross_point(a, ua, b, ub, mid, max(la, lb))
+        new_pts[0] = new_pts[-1] = c
+
+    return new_pts
+
+
+def snap_line_angles(prims, step=ANGLE_STEP, close_tol=25.0):
+    """1ストローク分のプリミティブについて、線分の角度を step 度刻みに丸める"""
+    prims = list(prims)
+
+    i = 0
+    while i < len(prims):
+        if prims[i]["type"] != "線分":
+            i += 1
+            continue
+
+        j = i
+        while j < len(prims) and prims[j]["type"] == "線分":   # 連続する線分のまとまり
+            j += 1
+
+        chain = [prims[i]["start"]] + [p["end"] for p in prims[i:j]]
+        new_pts = _snap_chain(chain, step, close_tol)
+
+        for k, p in enumerate(prims[i:j]):
+            p["start"], p["end"] = new_pts[k], new_pts[k + 1]
+            p["length"] = float(np.hypot(*(new_pts[k + 1] - new_pts[k])))
+
+        i = j
+
+    return prims
+
+
+# ==========================================================
+# 清書結果をキャンバスに戻すための fabric.js オブジェクト生成
+# ==========================================================
+def to_fabric_path(xy, color, stroke_width):
+    """点列を fabric.js の path オブジェクト（辞書）に変換する"""
+    xy = np.asarray(xy, dtype=float)
+    cmds = [["M", float(xy[0, 0]), float(xy[0, 1])]]
+    cmds += [["L", float(x), float(y)] for x, y in xy[1:]]
+
+    minx, miny = xy.min(axis=0)
+    maxx, maxy = xy.max(axis=0)
+    return {
+        "type": "path", "version": "4.4.0", "originX": "left", "originY": "top",
+        "left": float(minx), "top": float(miny),
+        "width": float(maxx - minx), "height": float(maxy - miny),
+        "fill": None, "stroke": color, "strokeWidth": stroke_width,
+        "strokeDashArray": None, "strokeLineCap": "round", "strokeDashOffset": 0,
+        "strokeLineJoin": "round", "strokeUniform": False, "strokeMiterLimit": 10,
+        "scaleX": 1, "scaleY": 1, "angle": 0, "flipX": False, "flipY": False,
+        "opacity": 1, "shadow": None, "visible": True, "backgroundColor": "",
+        "fillRule": "nonzero", "paintFirst": "fill",
+        "globalCompositeOperation": "source-over", "skewX": 0, "skewY": 0,
+        "path": cmds,
+    }
+
+
+# ==========================================================
+# 骨組みモデル（節点・部材）の構築
+#   線分プリミティブだけを部材として扱う。円弧は解析対象外。
+#   キャンバスは y が下向きなので、モデルは y を反転して保持する（y上向き）。
+# ==========================================================
+def to_math(p):
+    """キャンバス座標 → 数学座標（y上向き）"""
+    return np.array([p[0], CANVAS_H - p[1]], dtype=float)
+
+
+def to_canvas(p):
+    """数学座標 → キャンバス座標"""
+    return np.array([p[0], CANVAS_H - p[1]], dtype=float)
+
+
+def point_on_segment(a, b, c, tol):
+    """線分 ab 上に点 c が乗っているか（乗っていれば端点からの距離を返す）"""
+    ab = b - a
+    L2 = float(ab @ ab)
+    if L2 < 1e-12:
+        return None
+    t = float((c - a) @ ab) / L2
+    if not (1e-6 < t < 1 - 1e-6):
+        return None
+    foot = a + t * ab
+    if float(np.hypot(*(c - foot))) > tol:
+        return None
+    return t
+
+
+def build_frame(prims, node_tol):
+    """線分プリミティブから node_df / line_df を作る（座標は数学座標のpx）"""
+    segments = [(to_math(p["start"]), to_math(p["end"]))
+                for p in prims if p["type"] == "線分"]
+    # 長さが節点判定距離に満たない線分は、節点を増やすだけなので捨てる
+    segments = [(a, b) for a, b in segments if float(np.hypot(*(b - a))) > node_tol]
+
+    nodes = []                       # 節点座標のリスト
+
+    def node_id(p):
+        """近い既存節点があればその番号、無ければ新規登録"""
+        for i, q in enumerate(nodes):
+            if float(np.hypot(*(p - q))) <= node_tol:
+                return i
+        nodes.append(np.array(p, dtype=float))
+        return len(nodes) - 1
+
+    members = []
+    for a, b in segments:
+        ia, ib = node_id(a), node_id(b)
+        if ia != ib:
+            members.append([ia, ib])
+
+    # 部材の途中に他の節点が乗っている場合は、そこで部材を分割する
+    changed = True
+    while changed:
+        changed = False
+        for m_i, (ia, ib) in enumerate(list(members)):
+            a, b = nodes[ia], nodes[ib]
+            hits = []
+            for k in range(len(nodes)):
+                if k in (ia, ib):
+                    continue
+                t = point_on_segment(a, b, nodes[k], node_tol)
+                if t is not None:
+                    hits.append((t, k))
+            if hits:
+                hits.sort()
+                chain = [ia] + [k for _, k in hits] + [ib]
+                members.pop(m_i)
+                members.extend([[chain[i], chain[i + 1]] for i in range(len(chain) - 1)])
+                changed = True
+                break
+
+    # 重複部材の除去
+    seen, uniq = set(), []
+    for ia, ib in members:
+        key = tuple(sorted((ia, ib)))
+        if key not in seen:
+            seen.add(key)
+            uniq.append([ia, ib])
+
+    node_df = pd.DataFrame(
+        [{"No": i, "x": float(p[0]), "y": float(p[1])} for i, p in enumerate(nodes)]
+    )
+    line_df = pd.DataFrame(
+        [{"s_node": ia, "e_node": ib} for ia, ib in uniq]
+    )
+    if len(node_df) == 0:
+        node_df = pd.DataFrame(columns=["No", "x", "y"])
+    if len(line_df) == 0:
+        line_df = pd.DataFrame(columns=["s_node", "e_node"])
+    return node_df, line_df
+
+
+def nearest_node(node_df, p, tol):
+    """数学座標 p に最も近い節点番号（tol以内）"""
+    if len(node_df) == 0:
+        return None
+    d = np.hypot(node_df["x"].values - p[0], node_df["y"].values - p[1])
+    i = int(np.argmin(d))
+    return int(node_df["No"].iloc[i]) if d[i] <= tol else None
+
+
+# ==========================================================
+# 支点・荷重条件
+#   節点番号は清書のたびに振り直されるので、条件は「座標」で保持して毎回マッピングする
+# ==========================================================
+BLANK_COND = {"stick": 0, "s_ang": 0.0, "point": 0, "point_ang": 270.0,
+              "moment": 0, "moment_dir": 0}
+STICK_NAME = {0: "-", 1: "ピン", 2: "ローラー", 3: "固定"}
+
+
+def conditions_to_df(conditions, node_df, tol):
+    """条件リストを input_df（節点番号つき）に変換する"""
+    rows = []
+    for c in conditions:
+        no = nearest_node(node_df, np.array([c["x"], c["y"]]), tol)
+        if no is None:
+            continue
+        row = {"No": no}
+        row.update({k: c[k] for k in BLANK_COND})
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(columns=["No"] + list(BLANK_COND))
+    df = pd.DataFrame(rows)
+    return df.groupby("No", as_index=False).last()
+
+
+def make_dfs(node_df, line_df, input_df, E, A, I, scale, P, M0):
+    """FEMプログラムへ渡すためのデータ作成（draw_lib.py の make_dfs と同じ列構成）"""
+    nodes = node_df.copy()
+    nodes["x"] = nodes["x"] * scale          # px → m
+    nodes["y"] = nodes["y"] * scale
+    for col in ["rc_x", "rc_y", "rc_m", "ef_x", "ef_y", "ef_m", "s_ang"]:
+        nodes[col] = 0.0
+
+    for _, r in input_df.iterrows():
+        m = nodes["No"] == r["No"]
+        if r["stick"] == 1:                  # ピン支点
+            nodes.loc[m, ["rc_x", "rc_y"]] = [1, 1]
+        elif r["stick"] == 2:                # ローラー支点
+            # s_ang を与えると節点座標系ごと傾き、傾斜ローラーになる
+            nodes.loc[m, "rc_y"] = 1
+            nodes.loc[m, "s_ang"] = float(r.get("s_ang", 0.0))
+        elif r["stick"] == 3:                # 固定支点
+            nodes.loc[m, ["rc_x", "rc_y", "rc_m"]] = [1, 1, 1]
+
+        if r["point"] == 1:                  # 集中荷重（point_ang 方向に大きさ P）
+            a = math.radians(float(r["point_ang"]))
+            nodes.loc[m, "ef_x"] += P * math.cos(a)
+            nodes.loc[m, "ef_y"] += P * math.sin(a)
+
+        if r["moment"] == 1:                 # モーメント荷重
+            nodes.loc[m, "ef_m"] += M0 if r["moment_dir"] == 0 else -M0
+
+    rows = []
+    for _, r in line_df.iterrows():
+        p = nodes[nodes["No"] == r["s_node"]][["x", "y"]].values[0].astype(float)
+        q = nodes[nodes["No"] == r["e_node"]][["x", "y"]].values[0].astype(float)
+        rows.append({
+            "young": E, "area": A, "s_moment": I,
+            "length": float(np.hypot(*(q - p))),
+            "angle": math.degrees(math.atan2(q[1] - p[1], q[0] - p[0])) % 360,
+            "start": int(r["s_node"]), "end": int(r["e_node"]),
+            "Ws": 0.0, "We": 0.0,
+        })
+    elements_df = pd.DataFrame(
+        rows, columns=["young", "area", "s_moment", "length", "angle", "start", "end", "Ws", "We"]
+    )
+    nodes_df = nodes[["No", "x", "y", "rc_x", "rc_y", "rc_m",
+                      "ef_x", "ef_y", "ef_m", "s_ang"]]
+    return elements_df, nodes_df
+
+
+# ==========================================================
+# キャンバスに描く記号（支点・荷重）
+# ==========================================================
+def cond_symbols(node_df, input_df, stroke_width):
+    """支点・荷重を表す fabric オブジェクトのリスト（キャンバス座標）"""
+    objs = []
+    for _, r in input_df.iterrows():
+        hit = node_df[node_df["No"] == r["No"]]
+        if len(hit) == 0:
+            continue
+        cx, cy = to_canvas(hit[["x", "y"]].values[0].astype(float))
+
+        if r["stick"] in (1, 2):                          # ピン / ローラー
+            objs.append(to_fabric_path(
+                [[cx, cy], [cx - 11, cy + 19], [cx + 11, cy + 19], [cx, cy]],
+                COND_COLOR, stroke_width))
+            if r["stick"] == 2:                           # ローラーは下に線を1本
+                objs.append(to_fabric_path(
+                    [[cx - 13, cy + 24], [cx + 13, cy + 24]], COND_COLOR, stroke_width))
+        elif r["stick"] == 3:                             # 固定
+            objs.append(to_fabric_path(
+                [[cx - 16, cy], [cx + 16, cy]], COND_COLOR, stroke_width))
+            for k in range(-3, 4):                        # ハッチング
+                objs.append(to_fabric_path(
+                    [[cx + k * 5, cy], [cx + k * 5 - 6, cy + 10]], COND_COLOR, 1))
+
+        if r["point"] == 1:                               # 集中荷重（矢印）
+            a = math.radians(float(r["point_ang"]))
+            d = np.array([math.cos(a), -math.sin(a)])     # キャンバスは y 下向き
+            tail = np.array([cx, cy]) - d * 45
+            head = np.array([cx, cy]) - d * 4
+            n = np.array([-d[1], d[0]])
+            objs.append(to_fabric_path([tail, head], COND_COLOR, stroke_width))
+            objs.append(to_fabric_path(
+                [head - d * 10 + n * 5, head, head - d * 10 - n * 5], COND_COLOR, stroke_width))
+
+        if r["moment"] == 1:                              # モーメント荷重（円弧＋矢じり）
+            sign = 1 if r["moment_dir"] == 0 else -1
+            t = np.linspace(math.radians(40), math.radians(300), 40)[::sign]
+            arc = np.column_stack([cx + 18 * np.cos(t), cy - 18 * np.sin(t)])
+            objs.append(to_fabric_path(arc, COND_COLOR, stroke_width))
+            tip, prev = arc[-1], arc[-4]
+            d = (tip - prev) / max(np.hypot(*(tip - prev)), 1e-9)
+            n = np.array([-d[1], d[0]])
+            objs.append(to_fabric_path(
+                [tip - d * 9 + n * 5, tip, tip - d * 9 - n * 5], COND_COLOR, stroke_width))
+
+    return objs
+
+
+def node_marker(cx, cy, r=4):
+    """節点を表す小さなひし形（クリック入力の circle と区別するため path で描く）"""
+    return to_fabric_path(
+        [[cx, cy - r], [cx + r, cy], [cx, cy + r], [cx - r, cy], [cx, cy - r]],
+        NODE_COLOR, 2)
+
+
+def render_objects(stroke_width, show_nodes=True):
+    """キャンバスに読み込ませる図形リストを組み立てる"""
+    objs = []
+    for p in st.session_state.prims:
+        color = LINE_COLOR if p["type"] == "線分" else ARC_COLOR
+        objs.append(to_fabric_path(primitive_xy(p), color, stroke_width))
+
+    node_df = st.session_state.node_df
+    input_df = conditions_to_df(st.session_state.conditions, node_df, NODE_TOL)
+    objs.extend(cond_symbols(node_df, input_df, stroke_width))
+
+    if show_nodes:
+        for _, r in node_df.iterrows():
+            cx, cy = to_canvas(np.array([r["x"], r["y"]], dtype=float))
+            objs.append(node_marker(cx, cy))
+
+    return {"version": "4.4.0", "objects": objs}
+
+
+def refresh(stroke_width, show_nodes):
+    """モデルを組み直してキャンバスを描き直す"""
+    st.session_state.node_df, st.session_state.line_df = build_frame(
+        st.session_state.prims, NODE_TOL
+    )
+    st.session_state.drawing = render_objects(stroke_width, show_nodes)
+    st.session_state.n_shapes = len(st.session_state.drawing["objects"])
+    st.session_state.canvas_id += 1
+
+
+# ==========================================================
+# 応力図の作図
+# ==========================================================
+def diagram_figure(dfs, node_df, line_df, key, mag, scale, title):
+    """N図 / Q図 / M図 / 変形図を matplotlib で描く
+
+    key : "N" / "Q" / "M" / "deform"
+    mag : 表示倍率（px）
+    """
+    fig, ax = plt.subplots(figsize=(6.4, 4.4), dpi=130)
+
+    # --- 骨組み（灰色） ---
+    for _, r in line_df.iterrows():
+        p = node_df[node_df["No"] == r["s_node"]][["x", "y"]].values[0].astype(float)
+        q = node_df[node_df["No"] == r["e_node"]][["x", "y"]].values[0].astype(float)
+        ax.plot([p[0], q[0]], [p[1], q[1]], color="0.55", lw=1.6, zorder=2)
+
+    if key == "deform":
+        vmax = max((float(np.max(np.hypot(d["dx"], d["dy"]))) for d in dfs if len(d)), default=0.0)
+        for d in dfs:
+            if len(d) == 0:
+                continue
+            # 骨組みはpx、変位はmなので、それぞれ単位を揃えてから足す
+            k = (mag / vmax) if vmax > 0 else 0.0
+            ax.plot(d["x"] / scale + d["dx"] * k, d["y"] / scale + d["dy"] * k,
+                    color="#d62728", lw=2.0, zorder=3)
+        ax.set_title(f"{title}   (max disp = {vmax:.4g} m)", fontsize=10)
+    else:
+        vmax = max((float(np.max(np.abs(d[key]))) for d in dfs if len(d)), default=0.0)
+        k = (mag / vmax) if vmax > 0 else 0.0
+
+        pos_color = {"N": "#d62728", "Q": "#1f77b4", "M": "#2ca02c"}[key]
+        neg_color = {"N": "#1f77b4", "Q": "#ff7f0e", "M": "#9467bd"}[key]
+
+        for d in dfs:
+            if len(d) == 0:
+                continue
+            base = np.column_stack([d["x"].values, d["y"].values]) / scale
+            ang = math.atan2(base[-1, 1] - base[0, 1], base[-1, 0] - base[0, 0])
+            normal = np.array([-math.sin(ang), math.cos(ang)])   # 部材直交方向
+
+            v = d[key].values
+            # M は下側引張が正なので、正の値を材の下側（-法線側）に描く
+            off = base + np.outer(-v * k if key == "M" else v * k, normal)
+
+            for i in range(len(base) - 1):
+                poly = np.array([base[i], base[i + 1], off[i + 1], off[i]])
+                vm = (v[i] + v[i + 1]) / 2
+                ax.fill(poly[:, 0], poly[:, 1], color=pos_color if vm >= 0 else neg_color,
+                        alpha=0.30, lw=0, zorder=1)
+            ax.plot(off[:, 0], off[:, 1], color="0.2", lw=1.2, zorder=3)
+
+        unit = "kN" if key in ("N", "Q") else "kN·m"
+        ax.set_title(f"{title}   (max |{key}| = {vmax:.4g} {unit})", fontsize=10)
+
+    ax.set_aspect("equal")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for s in ax.spines.values():
+        s.set_color("0.85")
+    ax.margins(0.18)
+    fig.tight_layout()
+    return fig
+
+
+# ==========================================================
+# UI
+# ==========================================================
+st.sidebar.header("操作")
+op_mode = st.sidebar.radio("操作モード", ["描画", "条件入力", "移動"], horizontal=True)
+cond_kind = st.sidebar.radio(
+    "入力する条件",
+    ["ピン支点", "ローラー支点", "固定支点", "集中荷重", "モーメント荷重", "条件を消す"],
+    disabled=(op_mode != "条件入力"),
+)
+
+st.sidebar.header("清書のパラメータ")
+epsilon = st.sidebar.slider("epsilon（RDPの閾値）", 0.0, 50.0, 5.0, 0.1)
+tol = st.sidebar.slider("あてはめ許容誤差 (px)", 0.5, 30.0, 5.0, 0.5)
+NODE_TOL = st.sidebar.slider("節点をまとめる距離 (px)", 1, 60, 18)
+stroke_width = st.sidebar.slider("線の太さ", 1, 10, 3)
+show_nodes = st.sidebar.checkbox("節点を表示", True)
+auto = st.sidebar.checkbox("描き終わったら自動で清書", True)
+
+st.sidebar.header("解析条件")
+scale = st.sidebar.number_input("縮尺 (m/px)", 0.001, 1.0, 0.02, 0.001, format="%.3f")
+E = st.sidebar.number_input("ヤング係数 E (kN/m²)", 1.0, 1e12, 2.05e8, format="%.3e")
+A = st.sidebar.number_input("断面積 A (m²)", 1e-6, 10.0, 1.0e-2, format="%.3e")
+I = st.sidebar.number_input("断面二次モーメント I (m⁴)", 1e-12, 10.0, 1.0e-4, format="%.3e")
+P = st.sidebar.number_input("集中荷重の大きさ P (kN)", 0.0, 1e6, 10.0)
+load_ang = st.sidebar.number_input("集中荷重の向き (°: 0=右, 90=上)", -360.0, 360.0, 270.0, 15.0)
+roller_ang = st.sidebar.number_input("ローラーの傾き s_ang (°: 0=鉛直拘束)", -180.0, 180.0, 0.0, 15.0,
+                                     help="節点座標系ごと傾けて傾斜ローラーにします")
+M0 = st.sidebar.number_input("モーメント荷重 M (kN·m)", 0.0, 1e6, 10.0)
+div = st.sidebar.slider("部材の分割数", 2, 50, 20)
+mag = st.sidebar.slider("応力図の表示倍率 (px)", 10, 200, 60, 5)
+
+# セッション状態の初期化
+st.session_state.setdefault("drawing", None)      # キャンバスに読み込ませる図形
+st.session_state.setdefault("canvas_id", 0)       # 図形を差し替えるためのキー
+st.session_state.setdefault("n_shapes", 0)        # 描き込み済みオブジェクト数
+st.session_state.setdefault("prims", [])          # 清書済みの図形
+st.session_state.setdefault("conditions", [])     # 支点・荷重（座標で保持）
+if "node_df" not in st.session_state:
+    st.session_state.node_df = pd.DataFrame(columns=["No", "x", "y"])
+    st.session_state.line_df = pd.DataFrame(columns=["s_node", "e_node"])
+
+c1, c2, c3 = st.columns([1, 1, 4])
+if c1.button("消去"):
+    st.session_state.prims = []
+    st.session_state.conditions = []
+    refresh(stroke_width, show_nodes)
+    st.rerun()
+if c2.button("条件のみ消去"):
+    st.session_state.conditions = []
+    refresh(stroke_width, show_nodes)
+    st.rerun()
+
+if op_mode == "条件入力":
+    st.info("キャンバス上の節点（赤いひし形）付近をクリックすると、選んだ条件が入力されます。")
+
+canvas_mode = {"描画": "freedraw", "条件入力": "point", "移動": "transform"}[op_mode]
+
+# キャンバスの設定
+canvas_result = st_canvas(
+    fill_color="rgba(0, 0, 0, 0)",   # 塗りつぶしなし
+    stroke_width=stroke_width,       # 線の太さ
+    stroke_color="#000000",          # 手書き線の色
+    background_color="#FFFFFF",      # 背景色
+    background_image=None,           # 背景画像（なし）
+    update_streamlit=True,           # Streamlitをリアルタイムで更新
+    width=CANVAS_W,
+    height=CANVAS_H,
+    drawing_mode=canvas_mode,        # 描画モード
+    point_display_radius=4,
+    initial_drawing=st.session_state.drawing,
+    key=f"canvas_{st.session_state.canvas_id}",
+)
+
+objects = (canvas_result.json_data or {}).get("objects", [])
+
+# ---- 描画モード：新しいストロークを清書して図形リストに足す ----
+if op_mode == "描画" and auto and len(objects) > st.session_state.n_shapes:
+    for obj in objects[st.session_state.n_shapes:]:
+        if str(obj.get("type", "")).lower() != "path":
+            continue
+        pts = path_to_points(obj.get("path", []))
+        if len(pts) < 2:
+            continue
+        _, prims = segment_stroke(pts, epsilon, tol)
+        # 清書の一部として、線分の角度を15°刻みに自動調整する
+        prims = snap_line_angles(prims, ANGLE_STEP, close_tol=NODE_TOL * 1.5)
+        st.session_state.prims.extend(prims)
+    refresh(stroke_width, show_nodes)
+    st.rerun()
+
+# ---- 条件入力モード：クリック位置に一番近い節点へ条件を入れる ----
+if op_mode == "条件入力":
+    clicks = [o for o in objects if str(o.get("type", "")).lower() == "circle"]
+    if clicks:
+        o = clicks[-1]
+        r = float(o.get("radius", 4)) * float(o.get("scaleX", 1) or 1)
+        p = to_math([float(o["left"]) + r, float(o["top"]) + r])
+        no = nearest_node(st.session_state.node_df, p, max(NODE_TOL, 20))
+
+        if no is not None:
+            nd = st.session_state.node_df
+            xy = nd[nd["No"] == no][["x", "y"]].values[0].astype(float)
+            cond = next((c for c in st.session_state.conditions
+                         if np.hypot(c["x"] - xy[0], c["y"] - xy[1]) <= NODE_TOL), None)
+            if cond is None:
+                cond = {"x": float(xy[0]), "y": float(xy[1])}
+                cond.update(BLANK_COND)
+                st.session_state.conditions.append(cond)
+
+            if cond_kind == "ピン支点":
+                cond["stick"] = 0 if cond["stick"] == 1 else 1
+            elif cond_kind == "ローラー支点":
+                cond["stick"] = 0 if cond["stick"] == 2 else 2
+                cond["s_ang"] = float(roller_ang) % 360
+            elif cond_kind == "固定支点":
+                cond["stick"] = 0 if cond["stick"] == 3 else 3
+            elif cond_kind == "集中荷重":
+                cond["point"] = 0 if cond["point"] == 1 else 1
+                cond["point_ang"] = float(load_ang) % 360
+            elif cond_kind == "モーメント荷重":
+                if cond["moment"] == 0:
+                    cond["moment"], cond["moment_dir"] = 1, 0
+                elif cond["moment_dir"] == 0:
+                    cond["moment_dir"] = 1
+                else:
+                    cond["moment"] = 0
+            elif cond_kind == "条件を消す":
+                cond.update(BLANK_COND)
+
+            st.session_state.conditions = [
+                c for c in st.session_state.conditions
+                if any(c[k] for k in ("stick", "point", "moment"))
+            ]
+
+        refresh(stroke_width, show_nodes)
+        st.rerun()
+
+
+# ==========================================================
+# 判定結果 / モデルの表示
+# ==========================================================
+node_df, line_df = st.session_state.node_df, st.session_state.line_df
+input_df = conditions_to_df(st.session_state.conditions, node_df, NODE_TOL)
+prims = st.session_state.prims
+
+if prims:
+    with st.expander(f"清書の判定結果：{len(prims)} 個の図形", expanded=False):
+        rows = []
+        for k, p in enumerate(prims, 1):
+            if p["type"] == "線分":
+                detail = f"長さ {p['length']:.1f} px"
+            else:
+                detail = f"半径 {p['radius']:.1f} px / 中心角 {abs(np.degrees(p['a1'] - p['a0'])):.0f}°"
+            rows.append({
+                "#": k, "種類": p["type"],
+                "始点": f"({p['start'][0]:.0f}, {p['start'][1]:.0f})",
+                "終点": f"({p['end'][0]:.0f}, {p['end'][1]:.0f})",
+                "詳細": detail, "最大誤差(px)": round(p["error"], 2),
+            })
+        st.dataframe(rows, hide_index=True, use_container_width=True)
+else:
+    st.info("キャンバスに線を描いてください。描き終わると自動で清書されます。")
+
+col1, col2 = st.columns(2)
+with col1:
+    st.subheader(f"節点 {len(node_df)} / 部材 {len(line_df)}")
+    if len(node_df) > 0:
+        view = node_df.copy()
+        view["支点"] = view["No"].map(
+            {int(r["No"]): STICK_NAME[int(r["stick"])] for _, r in input_df.iterrows()}
+        ).fillna("-")
+        view["荷重"] = view["No"].map({
+            int(r["No"]): ", ".join(
+                ([f"P={P:g}kN @{r['point_ang']:.0f}°"] if r["point"] == 1 else [])
+                + ([f"M={M0:g}kN·m"] if r["moment"] == 1 else [])
+            ) for _, r in input_df.iterrows()
+        }).fillna("")
+        st.dataframe(view.round(1), hide_index=True, use_container_width=True)
+with col2:
+    st.subheader("部材")
+    st.dataframe(line_df, hide_index=True, use_container_width=True)
+
+# ==========================================================
+# 応力図（N・Q・M）
+# ==========================================================
+st.header("応力図")
+st.caption(f"FEM: {FEM_SOURCE}")
+
+n_stick = int((input_df["stick"] != 0).sum()) if len(input_df) else 0
+n_load = int(((input_df["point"] != 0) | (input_df["moment"] != 0)).sum()) if len(input_df) else 0
+
+if len(line_df) == 0:
+    st.info("部材がありません。線分を描いてください（円弧は解析対象外です）。")
+elif n_stick == 0 or n_load == 0:
+    st.warning(f"支点 {n_stick} 個・荷重 {n_load} 個です。"
+               "「条件入力」モードで支点と荷重をそれぞれ1つ以上入力してください。")
+else:
+    elements_df, nodes_df = make_dfs(node_df, line_df, input_df, E, A, I, scale, P, M0)
+    try:
+        dfs = solve(elements_df, nodes_df, div=div)
+    except UnstableStructure as e:
+        dfs = None
+        st.error(f"解析できませんでした：{e}")
+    except Exception as e:
+        dfs = None
+        st.error(f"FEMプログラムでエラーが発生しました：{e}")
+
+    if dfs:
+        t1, t2, t3, t4 = st.tabs(["曲げモーメント図 M", "せん断力図 Q", "軸力図 N", "変形図"])
+        for tab, key, title in [
+            (t1, "M", "Bending moment M"),
+            (t2, "Q", "Shear force Q"),
+            (t3, "N", "Axial force N"),
+            (t4, "deform", "Deformation"),
+        ]:
+            with tab:
+                fig = diagram_figure(dfs, node_df, line_df, key, mag, scale, title)
+                st.pyplot(fig, use_container_width=True)
+                plt.close(fig)
+
+        cA, cB = st.columns(2)
+        with cA:
+            st.subheader("部材端の応力")
+            rows = []
+            for i, d in enumerate(dfs):
+                if len(d) == 0:
+                    continue
+                r = elements_df.iloc[i]
+                rows.append({
+                    "部材": f"{int(r['start'])}→{int(r['end'])}",
+                    "長さ(m)": round(float(r["length"]), 3),
+                    "N始(kN)": round(float(d["N"].iloc[0]), 2),
+                    "N終(kN)": round(float(d["N"].iloc[-1]), 2),
+                    "Q始(kN)": round(float(d["Q"].iloc[0]), 2),
+                    "Q終(kN)": round(float(d["Q"].iloc[-1]), 2),
+                    "M始(kN·m)": round(float(d["M"].iloc[0]), 2),
+                    "M終(kN·m)": round(float(d["M"].iloc[-1]), 2),
+                })
+            st.dataframe(rows, hide_index=True, use_container_width=True)
+        with cB:
+            st.subheader("反力")
+            rea = dfs[0].attrs.get("reactions")
+            if rea is not None:
+                rea = rea[(rea[["Rx", "Ry", "Rm"]].abs().sum(axis=1) > 1e-9)]
+                st.dataframe(rea.round(3), hide_index=True, use_container_width=True)
+            else:
+                st.write("反力データがありません（FEMプログラムの戻り値に含まれていません）。")
+
+        with st.expander("FEMプログラムへ渡したデータ"):
+            st.write("elements_df")
+            st.dataframe(elements_df.round(4), hide_index=True, use_container_width=True)
+            st.write("nodes_df")
+            st.dataframe(nodes_df.round(4), hide_index=True, use_container_width=True)
+
+with st.expander("描画結果のJSONデータ"):
+    st.json(canvas_result.json_data)
